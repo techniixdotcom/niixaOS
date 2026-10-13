@@ -72,7 +72,7 @@ LOCALE="en_GB.UTF-8"
 MIRROR_COUNTRY=""  # worked out from the chosen timezone - see pick_mirrors
 MAPPER="cryptroot"
 BTRFS_OPTS="noatime,compress=zstd,space_cache=v2"
-NIIX_BUILD="2026-10-13-r35"  # bump on every change - printed on the banner to verify freshness
+NIIX_BUILD="2026-10-13-r37"  # bump on every change - printed on the banner to verify freshness
 
 # -- Install mode ---------------------------------------------
 INSTALL_MODE=""    # "dualboot" | "singleboot"
@@ -1381,6 +1381,204 @@ def main():
 if __name__ == "__main__":
     main()
 NIIXDISPEOF
+}
+
+# -- rip: the dedication, scrolled like film credits ---------------------
+niix_rip_script() {
+    cat <<'RIPEOF'
+#!/bin/bash
+# rip - the NiiX dedication, scrolled slowly like film credits.
+#   rip              play it (Ctrl+C stops)
+#   RIP_DELAY=0.1 rip  faster or slower: seconds per line
+set -u
+
+delay=${RIP_DELAY:-0.3}
+[[ "$delay" =~ ^[0-9]*\.?[0-9]+$ ]] || delay=0.3
+
+# Only the names are coloured, one colour per person.
+reset=$'\033[0m'
+names=(
+    "ALAN MATHISON TURING" "Alan Turing"              $'\033[38;5;81m'
+    "TERRY ANDREW DAVIS"   "Terry Davis" "- Terry"    $'\033[38;5;220m'
+    "AARON HILLEL SWARTZ"  "Aaron Swartz"             $'\033[38;5;205m'
+    "SIR NICHOLAS WINTON"  "Nicholas Winton"          $'\033[38;5;118m'
+)
+
+colour_names() {
+    local line=$1 item colour="" i
+    # Walk the list backwards so each name meets its colour first.
+    for (( i = ${#names[@]} - 1; i >= 0; i-- )); do
+        item=${names[i]}
+        if [[ "$item" == $'\033'* ]]; then
+            colour=$item
+        else
+            line=${line//"$item"/"$colour$item$reset"}
+        fi
+    done
+    printf '%s\n' "$line"
+}
+
+if [ -t 1 ]; then
+    printf '\033[?25l'                        # hide the cursor
+    trap 'printf "%s\033[?25h\n" "$reset"; exit 130' INT TERM
+    trap 'printf "%s\033[?25h" "$reset"' EXIT
+    clear
+    printf '\n%.0s' $(seq "$(( $(tput lines 2>/dev/null || echo 24) - 1 ))")
+else
+    delay=0                                   # piped or redirected: no waiting
+fi
+
+while IFS= read -r line; do
+    colour_names "$line"
+    sleep "$delay"
+done <<'RIPTEXT'
+============================================================================
+
+  If you are reading this, you found the temple.
+  It was built for four people who did what needed doing.
+  This comment does nothing. That was always the point.
+
+
+                             
+                            /\
+                           //\\
+                          //  \\
+                         //  W \\
+                        //   T  \\
+                       //    D   \\
+                      //     S    \\
+                     //____________\\
+                    //              \\
+                   //  ___       ___ \\
+                  //  |   |     |   | \\
+                 //   | A |     | T |  \\
+                //    |   |     |   |   \\
+               //     |___|     |___|    \\
+              //       | |       | |      \\
+             //   ___  | |  ___  | |  ___  \\
+            //   |   | | | |   | | | |   |  \\
+           //    | A | | | |   | | | | T |   \\
+          //     |   | | | |   | | | |   |    \\
+         //      |___| | | |___| | | |___|     \\
+        //        | |  | |  | |  | |  | |       \\
+       //    ___  | |  | |  | |  | |  | |  ___   \\
+      //    |   | | |  | |  | |  | |  | | |   |   \\
+     //     | A | | |  | |  | |  | |  | | | N |    \\
+    //      |   | | |  | |  | |  | |  | | |   |     \\
+   //       |___| | |  | |  | |  | |  | | |___|      \\
+  //__________________________________________________\\
+  |                                                    |
+  |          T E M P L E   O F   T H E   R A M         |
+  |                                                    |
+  |____________________________________________________|
+  |||  |||  |||  |||  |||  |||   |||  |||  |||  |||  |||
+  |||  |||  |||  |||  |||  |||   |||  |||  |||  |||  |||
+
+  A = Alan Turing      T = Terry Davis
+  A = Aaron Swartz     N = Nicholas Winton
+
+============================================================================
+
+ALAN MATHISON TURING  //  1912 - 1954
+
+============================================================================
+
+  He asked whether machines could think before anyone
+  had built one worth asking about.
+  He broke Enigma. He shortened the war by years.
+  He saved millions of lives and was never allowed to know
+  that he had, because it was classified.
+
+  The country he saved chemically castrated him
+  for being gay. He died at 41, alone, an apple beside him.
+  Every computer that has ever run anything
+  is a footnote to his 1936 paper.
+
+  "We can only see a short distance ahead,
+   but we can see plenty there that needs to be done."
+
+============================================================================
+
+TERRY ANDREW DAVIS  //  1969 - 2018
+
+============================================================================
+
+  He built an entire operating system alone.
+  640x480. One process. No multitasking. Talked to God
+  in a language he wrote himself, on a machine he trusted
+  completely because he understood every layer of it.
+
+  TempleOS was not a joke. It was a cathedral.
+  He finished it. That is more than most people do.
+
+  "The compiler is proof that God loves us."
+
+============================================================================
+
+AARON HILLEL SWARTZ  //  1986 - 2013
+
+============================================================================
+
+  He was 14 when he helped draft RSS.
+  He helped build Creative Commons. He built Tor2web.
+  He co-founded Reddit and walked away from the money.
+  He believed that knowledge locked behind a paywall
+  was a violence done to the world, and he was right.
+
+  They offered him 35 years for downloading journal articles.
+  He was 26. He had already changed the internet twice.
+
+  "Information is power. But like all power, there are
+   those who want to keep it for themselves."
+
+============================================================================
+
+SIR NICHOLAS WINTON  //  1909 - 2015
+
+============================================================================
+
+  Not a builder of machines. A builder of something harder.
+
+  In 1938, a 29-year-old stockbroker cancelled his skiing
+  holiday and went to Prague instead.
+  He found Jewish families desperate to get their children
+  out before the Nazis arrived.
+
+  He organised eight trains.
+  669 children. Forged documents. Bribes. Paperwork.
+  He did it with a scrapbook and a typewriter
+  and told nobody for fifty years.
+
+  His wife found the scrapbook in the attic in 1988.
+  He was in the audience of a BBC programme.
+  The host asked if anyone recognised the names
+  in the book she was holding.
+  Every person in the room stood up.
+  They were his children.
+
+  He lived to 106. He never thought he had done
+  anything particularly remarkable.
+
+  "If something is not impossible, there must be
+   a way to do it."
+
+============================================================================
+
+  Four people. None of them asked for recognition.
+  One proved the machine was possible.
+  One talked to God inside it.
+  One tried to make sure it belonged to everyone.
+  One just went to Prague and got to work.
+  The world is better for all four of them.
+  Read the source. Keep it open. Keep building.
+  And if something is not impossible - do it.
+
+                   +-------------------------+
+                   |   "You are loved."      |
+                   |        - Terry          |
+                   +-------------------------+
+RIPTEXT
+RIPEOF
 }
 
 machine_description() {
@@ -4945,6 +5143,10 @@ update-desktop-database "$A" 2>/dev/null || true
 UNHIDEEOF
     chmod +x /mnt/usr/local/bin/niix-unhide-app
     log "Menu hide/unhide helpers installed (niix-hide-app / niix-unhide-app)"
+
+    # 'rip' in any terminal: the dedication at the end of this installer.
+    niix_rip_script > /mnt/usr/local/bin/rip
+    chmod 755 /mnt/usr/local/bin/rip
 
     # /etc/issue
     echo "NiiX Arch \r (\l)" > /mnt/etc/issue
@@ -8964,147 +9166,5 @@ sync
 reboot
 
 # ============================================================================
-
-#   If you are reading this, you found the temple.
-#   It was built for four people who did what needed doing.
-#   This comment does nothing. That was always the point.
-
-#
-#                              /\
-#                             /  \
-#                            / /\ \
-#                           / /  \ \
-#                          / / W  \ \
-#                         / /  T   \ \
-#                        / /   D    \ \
-#                       / /    S     \ \
-#                      //_____________\ \
-#                     //               \\
-#                    //  ___       ___  \\
-#                   //  |   |     |   |  \\
-#                  //   | A |     | T |   \\
-#                 //    |   |     |   |    \\
-#                //     |___|     |___|     \\
-#               //       | |       | |      \\
-#              //   ___  | |  ___  | |  ___  \\
-#             //   |   | | | |   | | | |   |  \\
-#            //    | A | | | |   | | | | T |   \\
-#           //     |   | | | |   | | | |   |    \\
-#          //      |___| | | |___| | | |___|     \\
-#         //        | |  | |  | |  | |  | |       \\
-#        //    ___  | |  | |  | |  | |  | |  ___   \\
-#       //    |   | | |  | |  | |  | |  | | |   |   \\
-#      //     | A | | |  | |  | |  | |  | | | N |    \\
-#     //      |   | | |  | |  | |  | |  | | |   |     \\
-#    //       |___| | |  | |  | |  | |  | | |___|      \\
-#   //____________________________________________________\\
-#   |                                                      |
-#   |          T E M P L E   O F   T H E   R A M          |
-#   |                                                      |
-#   |______________________________________________________|
-#   |||  |||  |||  |||  |||  |||  |||  |||  |||  |||  |||
-#   |||  |||  |||  |||  |||  |||  |||  |||  |||  |||  |||
-#
-#   A = Alan Turing      T = Terry Davis
-#   A = Aaron Swartz     N = Nicholas Winton
-
+#   The temple lives in niix_rip_script above - type 'rip' in a terminal.
 # ============================================================================
-
-# ALAN MATHISON TURING  //  1912 - 1954
-
-# ============================================================================
-
-#   He asked whether machines could think before anyone
-#   had built one worth asking about.
-#   He broke Enigma. He shortened the war by years.
-#   He saved millions of lives and was never allowed to know
-#   that he had, because it was classified.
-
-#   The country he saved chemically castrated him
-#   for being gay. He died at 41, alone, an apple beside him.
-#   Every computer that has ever run anything
-#   is a footnote to his 1936 paper.
-
-#   "We can only see a short distance ahead,
-#    but we can see plenty there that needs to be done."
-
-# ============================================================================
-
-# TERRY ANDREW DAVIS  //  1969 - 2018
-
-# ============================================================================
-
-#   He built an entire operating system alone.
-#   640x480. One process. No multitasking. Talked to God
-#   in a language he wrote himself, on a machine he trusted
-#   completely because he understood every layer of it.
-
-#   TempleOS was not a joke. It was a cathedral.
-#   He finished it. That is more than most people do.
-
-#   "The compiler is proof that God loves us."
-
-# ============================================================================
-
-# AARON HILLEL SWARTZ  //  1986 - 2013
-
-# ============================================================================
-
-#   He was 14 when he helped draft RSS.
-#   He helped build Creative Commons. He built Tor2web.
-#   He co-founded Reddit and walked away from the money.
-#   He believed that knowledge locked behind a paywall
-#   was a violence done to the world, and he was right.
-
-#   They offered him 35 years for downloading journal articles.
-#   He was 26. He had already changed the internet twice.
-
-#   "Information is power. But like all power, there are
-#    those who want to keep it for themselves."
-
-# ============================================================================
-
-# SIR NICHOLAS WINTON  //  1909 - 2015
-
-# ============================================================================
-
-#   Not a builder of machines. A builder of something harder.
-
-#   In 1938, a 29-year-old stockbroker cancelled his skiing
-#   holiday and went to Prague instead.
-#   He found Jewish families desperate to get their children
-#   out before the Nazis arrived.
-
-#   He organised eight trains.
-#   669 children. Forged documents. Bribes. Paperwork.
-#   He did it with a scrapbook and a typewriter
-#   and told nobody for fifty years.
-
-#   His wife found the scrapbook in the attic in 1988.
-#   He was in the audience of a BBC programme.
-#   The host asked if anyone recognised the names
-#   in the book she was holding.
-#   Every person in the room stood up.
-#   They were his children.
-
-#   He lived to 106. He never thought he had done
-#   anything particularly remarkable.
-
-#   "If something is not impossible, there must be
-#    a way to do it."
-
-# ============================================================================
-
-#   Four people. None of them asked for recognition.
-#   One proved the machine was possible.
-#   One talked to God inside it.
-#   One tried to make sure it belonged to everyone.
-#   One just went to Prague and got to work.
-#   The world is better for all four of them.
-#   Read the source. Keep it open. Keep building.
-#   And if something is not impossible - do it.
-
-#                    +-------------------------+
-#                    |   "You are loved."      |
-#                    |        - Terry          |
-#                    +-------------------------+
