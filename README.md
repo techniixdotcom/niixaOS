@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="assets/niixarch-logo.png" alt="niixaOS" width="120">
+  <img src="niixarch-logo.png" alt="niixaOS" width="120">
 </p>
 
 <h1 align="center">niixaOS</h1>
