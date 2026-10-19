@@ -81,7 +81,7 @@ LOCALE="en_GB.UTF-8"
 MAPPER="cryptroot"
 BTRFS_OPTS="noatime,compress=zstd,space_cache=v2"
 NIIX_MIN_GIB=40    # smallest space NiiX is installed into (system ~20 GB, the rest for games)
-NIIX_BUILD="2026-10-19-r55"  # bump on every change - printed on the banner to verify freshness
+NIIX_BUILD="2026-10-19-r57"  # bump on every change - printed on the banner to verify freshness
 
 # -- Install mode ---------------------------------------------
 INSTALL_MODE=""    # "dualboot" | "singleboot"
@@ -2995,6 +2995,13 @@ lib32-libpulse
 ?lib32-gst-plugins-base
 ?lib32-gst-plugins-good
 
+# VR: the OpenXR loader, and adb + udev rules for Quest/Pico headsets on a
+# USB cable (WiVRn streams over USB as well as Wi-Fi). WiVRn and xrizer are
+# in the AUR list below; SteamVR comes from Steam when it is wanted.
+openxr
+android-tools
+android-udev
+
 # Apps
 vlc
 filezilla
@@ -3005,6 +3012,9 @@ NIIXPKGSEOF
 
 # From the AUR - unless CachyOS's repository has them: built for the ISO, so
 # an install never compiles anything. Updated later with yay (niix-update).
+#   name                 one AUR package
+#   base=name,name,...   an AUR package that builds several (split) packages:
+#                        built once, all of the listed packages installed
 niix_aur_packages() {
     cat <<'NIIXAUREOF'
 helium-browser-bin
@@ -3012,6 +3022,8 @@ gnome-shell-extension-ddterm
 game-devices-udev
 xpadneo-dkms
 dxvk-bin
+wivrn-server=wivrn-server,lib32-wivrn-server,wivrn-dashboard
+xrizer=xrizer,xrizer-common,lib32-xrizer
 NIIXAUREOF
 }
 
@@ -3818,6 +3830,8 @@ for net in 10.0.0.0/8 172.16.0.0/12 192.168.0.0/16 fe80::/10 fd00::/8; do
     ufw allow in proto tcp from "$net" to any port 27036:27037 comment 'Steam Remote Play (LAN)'
     ufw allow in proto udp from "$net" to any port 5353 comment 'mDNS device discovery (LAN)'
     ufw allow in proto udp from "$net" port 1900 comment 'UPnP replies from the router (LAN)'
+    ufw allow in proto tcp from "$net" to any port 9757 comment 'WiVRn VR streaming (LAN)'
+    ufw allow in proto udp from "$net" to any port 9757 comment 'WiVRn VR streaming (LAN)'
 done
 
 ufw allow in proto udp from 0.0.0.0/32 port 68 to any port 67 comment 'Hotspot DHCP (devices without an address yet)'
@@ -7488,7 +7502,7 @@ highlight-appicon-hover-background-color='rgba(255, 107, 129, 0.15)'
 highlight-appicon-pressed-background-color='rgba(255, 107, 129, 0.25)'
 
 [org/gnome/shell/extensions/arcmenu]
-menu-layout='Budgie'
+menu-layout='Default'
 position-in-panel='Left'
 menu-button-appearance='Icon_Text'
 menu-button-text='NiiX'
@@ -7692,7 +7706,7 @@ def arcmenu_wanted():
         ("menu-button-icon", gv_str(icon)),
         ("menu-button-icon-size", "28"),
         ("position-in-panel", "'Left'"),
-        ("menu-layout", "'Budgie'"),
+        ("menu-layout", "'Default'"),
         # Pink accent theme (must match the dconf load block)
         ("override-menu-theme", "true"),
         ("menu-background-color", "'rgba(40, 24, 32, 0.98)'"),
@@ -7875,6 +7889,77 @@ Exec=/usr/local/bin/niix-steam-warmstart
 X-GNOME-Autostart-enabled=true
 STEAMAUTOEOF
     log "Steam: warm start at login + one-time first-launch notice"
+}
+
+# -- VR: ready for wireless and wired headsets -------------------------
+#  Standalone headsets (Quest, Pico, Vive Focus) stream from the PC with
+#  WiVRn, over Wi-Fi or a USB cable: open "WiVRn" from the menu and install
+#  its app on the headset. Avahi lets the headset find the PC. OpenVR games
+#  reach WiVRn through xrizer, which WiVRn picks up by itself.
+#  PC headsets (Valve Index, Vive, Bigscreen Beyond) use SteamVR, installed
+#  from Steam when wanted. GNOME lends it the headset's display (DRM lease),
+#  and game-devices-udev gives the user access to the headset.
+#  - Steam runs games in a container (pressure-vessel), which has to see
+#    WiVRn's socket and the system's OpenXR runtime. Set for every game in
+#    the session environment, so no per-game launch options are needed.
+#  - SteamVR's compositor needs CAP_SYS_NICE for asynchronous reprojection.
+#    SteamVR asks for the password to set it on first start, and again after
+#    each update that replaces the file. A path unit sets it instead, whenever
+#    the file appears or changes - only on a regular file owned by the user.
+setup_vr() {
+    local home
+    home=$(arch-chroot /mnt getent passwd "$USERNAME" | cut -d: -f6)
+    [[ -n "$home" ]] || home=/home/$USERNAME
+
+    mkdir -p /mnt/etc/environment.d
+    cat > /mnt/etc/environment.d/60-niix-vr.conf <<'VRENVEOF'
+PRESSURE_VESSEL_IMPORT_OPENXR_1_RUNTIMES=1
+PRESSURE_VESSEL_FILESYSTEMS_RW=${XDG_RUNTIME_DIR}/wivrn/comp_ipc
+VRENVEOF
+
+    cat > /mnt/usr/local/bin/niix-steamvr-caps <<'VRCAPSEOF'
+#!/bin/sh
+# NiiX: gives SteamVR's compositor CAP_SYS_NICE (asynchronous reprojection),
+# as SteamVR's own password prompt would. Run by niix-steamvr-caps.path.
+# Usage: niix-steamvr-caps USER
+user=$1
+home=$(getent passwd "$user" | cut -d: -f6)
+[ -n "$home" ] || exit 0
+f="$home/.local/share/Steam/steamapps/common/SteamVR/bin/linux64/vrcompositor-launcher"
+[ -f "$f" ] && [ ! -L "$f" ] || exit 0
+[ "$(stat -c %U "$f")" = "$user" ] || exit 0
+getcap "$f" | grep -q cap_sys_nice && exit 0
+setcap CAP_SYS_NICE=eip "$f" && echo "SteamVR compositor: CAP_SYS_NICE set"
+VRCAPSEOF
+    chmod 755 /mnt/usr/local/bin/niix-steamvr-caps
+
+    cat > /mnt/etc/systemd/system/niix-steamvr-caps.service <<VRCAPSSVCEOF
+[Unit]
+Description=Give SteamVR's compositor the priority it needs (NiiX)
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/niix-steamvr-caps $USERNAME
+
+[Install]
+WantedBy=multi-user.target
+VRCAPSSVCEOF
+
+    cat > /mnt/etc/systemd/system/niix-steamvr-caps.path <<VRCAPSPATHEOF
+[Unit]
+Description=Watch SteamVR's compositor for installs and updates (NiiX)
+
+[Path]
+PathChanged=$home/.local/share/Steam/steamapps/common/SteamVR/bin/linux64/vrcompositor-launcher
+Unit=niix-steamvr-caps.service
+
+[Install]
+WantedBy=multi-user.target
+VRCAPSPATHEOF
+
+    arch-chroot /mnt systemctl enable avahi-daemon.service niix-steamvr-caps.service niix-steamvr-caps.path \
+        2>/dev/null || warn "VR: could not enable Avahi or the SteamVR helper"
+    log "VR: WiVRn (Quest/Pico) + xrizer, SteamVR helper, Steam container settings"
 }
 
 # -- System-wide app settings ---------------------------------------
@@ -8293,6 +8378,7 @@ setup_desktop_apps() {
     write_desktop_defaults
     install_panel_fix
     setup_steam
+    setup_vr
     write_app_config
     write_user_files
     install_user_extensions
@@ -8361,6 +8447,7 @@ finish() {
     echo -e "  ${CYAN}-${NC}  Graphics: the most powerful GPU runs everything (${WHITE}niix-gpu status${NC})"
     echo -e "  ${CYAN}-${NC}  Steam one-time: Settings -> Compatibility -> Steam Play for all titles -> ${WHITE}Proton-CachyOS${NC}"
     echo -e "  ${CYAN}-${NC}  Update everything: ${WHITE}niix-update${NC}  -  Wi-Fi hotspot: ${WHITE}niix-hotspot start${NC}"
+    echo -e "  ${CYAN}-${NC}  VR: Quest/Pico -> open ${WHITE}WiVRn${NC} and pair the headset  -  Index/Vive -> install ${WHITE}SteamVR${NC} in Steam"
     echo -e "  ${CYAN}-${NC}  Snapper snapshots before/after every update; refresh the clean state: ${WHITE}sudo niixarch-refresh-clean${NC}"
     echo
     if [[ "$INSTALL_MODE" == "dualboot" ]]; then
@@ -8879,7 +8966,7 @@ INSTALLER=$WORK/install
 RELENG=/usr/share/archiso/configs/releng   # a few files are taken from Arch's own ISO
 
 # Filled from the installer's package list (read_manifest).
-REQUIRED=(); OPTIONAL=(); MANIFEST_GROUPS=(); SKIP=(); AUR=()
+REQUIRED=(); OPTIONAL=(); MANIFEST_GROUPS=(); SKIP=(); AUR=(); AUR_BASES=(); AUR_PKGS=()
 # Everything only the live session needs, for the installer to remove.
 LIVE_FILES=()
 
@@ -8975,6 +9062,18 @@ read_manifest() {
     extract NIIXAUREOF "$WORK/aur"
     mapfile -t AUR < <(sed 's/#.*//; s/[[:space:]]//g; /^$/d' "$WORK/aur")
     (( ${#REQUIRED[@]} > 50 && ${#AUR[@]} )) || die "The installer's package list looks incomplete."
+    local entry
+    local -a names
+    for line in "${AUR[@]}"; do
+        entry=${line%%=*}
+        AUR_BASES+=("$entry")
+        if [[ "$line" == *=* ]]; then
+            IFS=, read -ra names <<< "${line#*=}"
+            AUR_PKGS+=("${names[@]}")
+        else
+            AUR_PKGS+=("$entry")
+        fi
+    done
 }
 
 # clone_aur PKG : a fresh clone of the package's AUR repository.
@@ -9012,7 +9111,7 @@ build_aur_packages() {
     id builder &>/dev/null || useradd -m builder
     echo 'builder ALL=(ALL) NOPASSWD: /usr/bin/pacman' > /etc/sudoers.d/builder
     chown builder "$LOCALREPO"
-    for pkg in "${AUR[@]}"; do
+    for pkg in "${AUR_BASES[@]}"; do
         # CachyOS packages some of these itself - prebuilt and signed, and
         # ahead of a local build in the repo order anyway.
         if pacman -Si "$pkg" &>/dev/null; then
@@ -9141,7 +9240,7 @@ EOF
             note "Optional package not in the repositories right now - left out: $pkg"
         fi
     done
-    pkgs+=("${gnome[@]}" "${AUR[@]}")
+    pkgs+=("${gnome[@]}" "${AUR_PKGS[@]}")
     printf '%s\n' "${pkgs[@]}" | sort -u > "$PROFILE/packages.x86_64"
     local p
     for p in "${LIVE_ONLY_PACKAGES[@]}"; do
