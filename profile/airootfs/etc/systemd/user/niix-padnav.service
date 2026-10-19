@@ -1,0 +1,13 @@
+[Unit]
+Description=NiiX: game controllers move the pointer on the desktop
+Documentation=file:///usr/local/bin/niix-padnav
+PartOf=graphical-session.target
+After=graphical-session.target
+
+[Service]
+ExecStart=/usr/bin/python3 /usr/local/bin/niix-padnav
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=graphical-session.target

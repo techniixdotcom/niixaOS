@@ -1,0 +1,7 @@
+export DXVK_ASYNC=1
+export mesa_glthread=true
+export WINEFSYNC=1
+export WINEESYNC=1
+export WINE_FULLSCREEN_FSR=1
+export MESA_SHADER_CACHE_MAX_SIZE=10G
+export PROTON_ENABLE_NTSYNC=1

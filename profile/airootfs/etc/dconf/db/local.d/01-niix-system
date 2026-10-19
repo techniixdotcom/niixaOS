@@ -1,0 +1,9 @@
+[org/gnome/shell]
+enabled-extensions=['appindicatorsupport@rgcjonas.gmail.com', 'dash-to-panel@jderose9.github.com', 'arcmenu@arcmenu.com', 'screen-rotate@shyzus.github.io', 'tiling-assistant@leleat-on-github', 'ddterm@amezin.github.com', 'system-monitor@gnome-shell-extensions.gcampax.github.com', 'niix-osk@niixa.org']
+favorite-apps=['org.gnome.Nautilus.desktop', 'helium.desktop', 'org.gnome.TextEditor.desktop', 'net.lutris.Lutris.desktop', 'steam.desktop', 'com.heroicgameslauncher.hgl.desktop', 'com.ktechpit.whatsie.desktop', 'signal-desktop.desktop', 'com.stremio.Stremio.desktop']
+
+[org/gnome/settings-daemon/plugins/power]
+sleep-inactive-battery-type='suspend'
+
+[org/gnome/desktop/peripherals/touchpad]
+tap-to-click=true

@@ -1,0 +1,9 @@
+[Unit]
+Description=Watch SteamVR's compositor of %i for installs and updates (NiiX)
+
+[Path]
+PathChanged=/home/%i/.local/share/Steam/steamapps/common/SteamVR/bin/linux64/vrcompositor-launcher
+Unit=niix-steamvr-caps@%i.service
+
+[Install]
+WantedBy=multi-user.target

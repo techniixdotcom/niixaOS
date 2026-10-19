@@ -1,0 +1,108 @@
+#!/bin/bash
+# niix-hotspot-watchdog - keeps the NiiX Wi-Fi hotspot up (system service, root).
+#   Internet: HTTP checks of two independent endpoints - online if EITHER
+#             answers correctly (a captive portal fails both). Every 120s
+#             while online, every 5s while offline.
+#   Hotspot:  checked every 15s, and immediately on NetworkManager events
+#             (the dispatcher hook sends SIGUSR1). When it is found down the
+#             internet is re-checked on the spot; if online, 'niix-hotspot up'
+#             brings it back - next to the Wi-Fi connection when the card can,
+#             and never by taking over Wi-Fi that is the only internet.
+#   While offline the hotspot is left as it is, so phones stay associated.
+# Logs: journalctl -u niix-hotspot-watchdog -f
+set -u
+
+ONLINE_INTERVAL=120
+OFFLINE_INTERVAL=5
+HOTSPOT_INTERVAL=15
+
+probe_gnome() {
+    local body
+    body=$(curl -fsS --connect-timeout 3 --max-time 5 \
+        http://nmcheck.gnome.org/check_network_status.txt 2>/dev/null) || return 1
+    [ "$body" = "NetworkManager is online" ]
+}
+
+probe_google() {
+    local code
+    code=$(curl -sS -o /dev/null -w '%{http_code}' --connect-timeout 3 --max-time 5 \
+        http://www.gstatic.com/generate_204 2>/dev/null) || return 1
+    [ "$code" = "204" ]
+}
+
+internet_ok() {
+    probe_gnome || probe_google
+}
+
+hotspot_active() {
+    [ "$(nmcli -g GENERAL.STATE connection show niix-hotspot 2>/dev/null)" = "activated" ]
+}
+
+WAKE=0
+SLEEP_PID=""
+trap 'WAKE=1' USR1
+trap '[ -n "$SLEEP_PID" ] && kill "$SLEEP_PID" 2>/dev/null; exit 0' TERM INT
+
+# Interruptible sleep: SIGUSR1 (a NetworkManager event) ends it early.
+nap() {
+    sleep "$1" &
+    SLEEP_PID=$!
+    wait "$SLEEP_PID" 2>/dev/null
+    kill "$SLEEP_PID" 2>/dev/null
+    wait "$SLEEP_PID" 2>/dev/null
+    SLEEP_PID=""
+}
+
+online=unknown
+next_probe=0
+last_probe=-1000
+last_rc=""
+echo "started: internet check every ${ONLINE_INTERVAL}s (every ${OFFLINE_INTERVAL}s while offline), hotspot every ${HOTSPOT_INTERVAL}s"
+
+while true; do
+    if [ "$WAKE" -eq 1 ]; then
+        WAKE=0
+        next_probe=0
+    fi
+
+    now=$(date +%s)
+    hotspot_up=true
+    hotspot_active || hotspot_up=false
+
+    # Probe when due - and also right away whenever the hotspot is found down,
+    # so the decision to bring it back never rests on a stale "online".
+    if [ "$now" -ge "$next_probe" ] \
+        || { [ "$hotspot_up" = false ] && [ $(( now - last_probe )) -ge "$OFFLINE_INTERVAL" ]; }; then
+        last_probe=$now
+        if internet_ok; then
+            [ "$online" != true ] && echo "internet: online"
+            online=true
+            next_probe=$(( $(date +%s) + ONLINE_INTERVAL ))
+        else
+            [ "$online" != false ] && echo "internet: OFFLINE - re-checking every ${OFFLINE_INTERVAL}s"
+            online=false
+            next_probe=$(( $(date +%s) + OFFLINE_INTERVAL ))
+        fi
+    fi
+
+    if [ "$online" = true ] && [ "$hotspot_up" = false ]; then
+        niix-hotspot up >/dev/null 2>&1
+        rc=$?
+        if [ "$rc" -eq 0 ]; then
+            echo "hotspot: brought up"
+            last_rc=""
+        elif [ "$rc" != "$last_rc" ]; then
+            case "$rc" in
+                2) echo "hotspot: waiting - Wi-Fi is the only internet connection and this card can't share it (connect Ethernet or USB tethering)" ;;
+                3) echo "hotspot: no saved hotspot - run 'niix-hotspot start' once" ;;
+                *) echo "hotspot: failed to come up (rc=$rc) - retrying every ${HOTSPOT_INTERVAL}s" ;;
+            esac
+            last_rc="$rc"
+        fi
+    fi
+
+    wait_s=$(( next_probe - $(date +%s) ))
+    [ "$wait_s" -gt "$HOTSPOT_INTERVAL" ] && wait_s=$HOTSPOT_INTERVAL
+    [ "$wait_s" -lt 1 ] && wait_s=1
+    [ "$WAKE" -eq 1 ] || nap "$wait_s"
+done

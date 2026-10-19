@@ -1,0 +1,174 @@
+#!/bin/bash
+# customize-image - finishes the NiiX image while the ISO is built.
+#
+# Runs once, inside the new image, at the end of mkarchiso's package install
+# (pacman hook zz-niix-customize.hook). Everything here is the same on every
+# NiiX system, so it is done once, here, instead of on every install:
+# changes to files that packages own (they can't be shipped in airootfs),
+# services, firewall rules, desktop defaults and icons.
+#
+# The live ISO and installed systems both get this image; what only one of
+# them needs is handled by live-setup (live) and niix-install (installed).
+#
+# Removes itself and its hook at the end and leaves a marker the build checks:
+# a failure here fails the build instead of shipping a half-finished ISO.
+set -euo pipefail
+
+say() { echo "niix-customize: $*"; }
+
+# -- Package sources ------------------------------------------------------------
+install -m 644 /usr/local/share/niix/pacman.conf /etc/pacman.conf
+# Arch's mirror list ships fully commented out. A worldwide fallback until the
+# installer ranks mirrors near the user (the live session needs one too).
+cat > /etc/pacman.d/mirrorlist <<'EOF'
+# Worldwide fallback - the installer replaces this with the fastest mirrors
+# near the chosen time zone (reflector).
+Server = https://geo.mirror.pkgbuild.com/$repo/os/$arch
+Server = https://mirror.rackspace.com/archlinux/$repo/os/$arch
+Server = https://mirrors.kernel.org/archlinux/$repo/os/$arch
+EOF
+# cdn77.cachyos.org connects fast but often 404s on single packages: moved to
+# the end, commented out - never leaving a list without a server.
+for ml in /etc/pacman.d/cachyos-mirrorlist /etc/pacman.d/cachyos-v3-mirrorlist /etc/pacman.d/cachyos-v4-mirrorlist; do
+    [ -f "$ml" ] || continue
+    awk '
+        /^[[:space:]]*Server[[:space:]]*=[[:space:]]*https?:\/\/cdn77\.cachyos\.org/     { cdn[++c] = $0; next }
+        /^[[:space:]]*Server[[:space:]]*=[[:space:]]*https?:\/\/archlinux\.cachyos\.org/ { prim[++p] = $0; next }
+        /^[[:space:]]*Server[[:space:]]*=/                                                { oth[++o] = $0; next }
+        { head[++h] = $0 }
+        END {
+            for (i = 1; i <= h; i++) print head[i]
+            if (p + o > 0) {
+                for (i = 1; i <= p; i++) print prim[i]
+                for (i = 1; i <= o; i++) print oth[i]
+                for (i = 1; i <= c; i++) print "#" cdn[i] "  # disabled by NiiX (flaky cdn77)"
+            } else for (i = 1; i <= c; i++) print cdn[i]
+        }' "$ml" > "$ml.new"
+    if [ -s "$ml.new" ]; then mv -f "$ml.new" "$ml"; else rm -f "$ml.new"; fi
+done
+
+# AUR builds (yay): all cores, and no slow re-compression of every package.
+sed -i -e 's/^#\?MAKEFLAGS=.*/MAKEFLAGS="-j$(nproc)"/' \
+       -e "s/^#\?PKGEXT=.*/PKGEXT='.pkg.tar'/" \
+       -e 's/^#\?COMPRESSZST=.*/COMPRESSZST=(zstd -c -T0 --fast -)/' /etc/makepkg.conf
+
+# -- Branding, locale, shell ------------------------------------------------------
+/usr/local/lib/niix-branding
+for loc in "en_GB.UTF-8 UTF-8" "en_US.UTF-8 UTF-8"; do
+    grep -qxF "$loc" /etc/locale.gen || echo "$loc" >> /etc/locale.gen
+done
+locale-gen
+grep -qx fastfetch /etc/skel/.bashrc || echo fastfetch >> /etc/skel/.bashrc
+
+# -- Files that packages own --------------------------------------------------------
+install -m 644 /usr/local/share/niix/bluetooth-main.conf /etc/bluetooth/main.conf
+if grep -q '^SNAPPER_CONFIGS=' /etc/conf.d/snapper 2>/dev/null; then
+    sed -i 's/^SNAPPER_CONFIGS=.*/SNAPPER_CONFIGS="root"/' /etc/conf.d/snapper
+else
+    mkdir -p /etc/conf.d && echo 'SNAPPER_CONFIGS="root"' >> /etc/conf.d/snapper
+fi
+mkdir -p /etc/default
+printf 'SCX_SCHEDULER=scx_lavd\nSCX_FLAGS=\n' > /etc/default/scx
+
+# -- Firewall -------------------------------------------------------------------------
+# Nothing from outside may start a connection, except a few things that only
+# ever come from the local network. Everything this machine starts itself -
+# games, Steam, voice chat, updates - and the replies pass through (connection
+# tracking). Outgoing stays open.
+#   Steam Remote Play 27031-27036/udp, 27036-27037/tcp   mDNS 5353/udp
+#   SSDP replies from 1900/udp (UPnP for game ports)      WiVRn 9757 tcp+udp
+#   Hotspot: DHCP + DNS from 10.42.0.0/24 (DHCP also from 0.0.0.0, a phone
+#   asking for its first address), and its traffic forwarded to the internet.
+[ -f /etc/default/ufw ] && sed -i 's/^IPV6=.*/IPV6=yes/' /etc/default/ufw
+ufw default deny incoming
+ufw default allow outgoing
+ufw default deny routed
+ufw logging low
+for net in 10.0.0.0/8 172.16.0.0/12 192.168.0.0/16 fe80::/10 fd00::/8; do
+    ufw allow in proto udp from "$net" to any port 27031:27036 comment 'Steam Remote Play (LAN)'
+    ufw allow in proto tcp from "$net" to any port 27036:27037 comment 'Steam Remote Play (LAN)'
+    ufw allow in proto udp from "$net" to any port 5353 comment 'mDNS device discovery (LAN)'
+    ufw allow in proto udp from "$net" port 1900 comment 'UPnP replies from the router (LAN)'
+    ufw allow in proto tcp from "$net" to any port 9757 comment 'WiVRn VR streaming (LAN)'
+    ufw allow in proto udp from "$net" to any port 9757 comment 'WiVRn VR streaming (LAN)'
+done
+ufw allow in proto udp from 0.0.0.0/32 port 68 to any port 67 comment 'Hotspot DHCP (devices without an address yet)'
+ufw allow in proto udp from 10.42.0.0/24 to any port 67 comment 'Hotspot DHCP'
+ufw allow in proto udp from 10.42.0.0/24 to any port 53 comment 'Hotspot DNS'
+ufw allow in proto tcp from 10.42.0.0/24 to any port 53 comment 'Hotspot DNS'
+ufw route allow from 10.42.0.0/24 comment 'Hotspot clients to the internet'
+# ufw.service only loads the rules with ENABLED=yes; 'ufw enable' would also
+# try to load them into the build machine's kernel.
+sed -i 's/^ENABLED=.*/ENABLED=yes/' /etc/ufw/ufw.conf
+grep -q '^ENABLED=yes' /etc/ufw/ufw.conf
+grep -q '27031:27036' /etc/ufw/user.rules
+grep -q '10.42.0.0/24' /etc/ufw/user.rules
+grep -q -- '--dport 67 -s 0.0.0.0' /etc/ufw/user.rules
+
+# -- Services (live ISO and installed system) -------------------------------------------
+# Those only an installed system runs (firewall, updates, snapshots, NTFS
+# mounts...) are enabled by the installer.
+systemctl enable gdm NetworkManager NetworkManager-dispatcher systemd-resolved \
+    bluetooth power-profiles-daemon iio-sensor-proxy ananicy-cpp irqbalance \
+    niix-gpu niix-hardware
+systemctl disable NetworkManager-wait-online.service 2>/dev/null || true
+systemctl mask dnsmasq      # NetworkManager runs its own for the hotspot
+systemctl --global enable niix-padnav.service niix-display.service
+systemctl set-default graphical.target
+
+# LAVD, the sched-ext scheduler tuned for games. Newer packages start it with
+# scx_loader, older ones with scx.service - exactly one is enabled.
+if systemctl cat scx_loader.service &>/dev/null; then
+    systemctl enable scx_loader.service
+elif systemctl cat scx.service &>/dev/null; then
+    systemctl enable scx.service
+fi
+
+# -- Desktop ----------------------------------------------------------------------------
+# Fractional scaling and VRR: built in from GNOME 50, experimental before. Only
+# names this GNOME knows are written - an unknown one voids the whole setting.
+features=()
+for feature in scale-monitor-framebuffer xwayland-native-scaling variable-refresh-rate; do
+    gsettings range org.gnome.mutter experimental-features 2>/dev/null \
+        | grep -qxE "'?$feature'?" && features+=("'$feature'")
+done
+if (( ${#features[@]} )); then
+    printf '[org/gnome/mutter]\nexperimental-features=[%s]\n' "$(IFS=,; echo "${features[*]}")" \
+        > /etc/dconf/db/local.d/02-niix-mutter
+fi
+dconf update
+
+# Steam's own launcher has an absolute Exec path: the copy in /usr/local
+# (same file ID, earlier in the search path) goes through the NiiX wrapper.
+if [ -f /usr/share/applications/steam.desktop ]; then
+    sed 's|^Exec=/usr/bin/steam|Exec=/usr/local/bin/steam|' /usr/share/applications/steam.desktop \
+        > /usr/local/share/applications/steam.desktop
+fi
+
+# A tidier menu: helpers pulled in as dependencies are hidden, not removed
+# (the copy in /usr/local wins; delete it to show the app again).
+hidden=0
+for id in org.gnome.Music bssh bvnc avahi-discover org.gnome.Snapshot org.corectrl.CoreCtrl \
+          com.github.amezin.ddterm org.gnome.baobab lstopo org.gnome.Logs \
+          org.freedesktop.MalcontentControl assistant qdbusviewer linguist qv4l2 qvidcap designer \
+          org.gnome.SystemMonitor org.gnome.Terminal org.gnome.Console org.gnome.Totem \
+          org.gnome.Weather winetricks org.gnome.Tour; do
+    src=/usr/share/applications/$id.desktop
+    [ -f "$src" ] || continue
+    sed -e '/^NoDisplay=/d' -e '/^\[Desktop Entry\]/a NoDisplay=true' "$src" \
+        > "/usr/local/share/applications/$id.desktop"
+    hidden=$(( hidden + 1 ))
+done
+say "menu: $hidden apps hidden"
+update-desktop-database /usr/local/share/applications /usr/share/applications 2>/dev/null || true
+
+# NiiX icons for every app in the image (later ones: pacman hook + watcher).
+/usr/local/bin/niix-iconify --quiet
+gtk-update-icon-cache -f /usr/share/icons/NiiX
+
+# -- Done ---------------------------------------------------------------------------------
+mkdir -p /var/lib/niix
+date -u +%Y-%m-%dT%H:%M:%SZ > /var/lib/niix/image-customized
+rm -f /etc/pacman.d/hooks/zz-niix-customize.hook
+rm -rf /usr/local/lib/niix-build
+say "image finished"

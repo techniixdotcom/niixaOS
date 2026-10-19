@@ -1,0 +1,12 @@
+[Unit]
+Description=NiiX: detect the hardware and apply its settings
+After=systemd-modules-load.service
+Before=display-manager.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/bin/niix-hardware apply
+
+[Install]
+WantedBy=multi-user.target

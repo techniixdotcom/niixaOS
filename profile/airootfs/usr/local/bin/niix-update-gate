@@ -1,0 +1,9 @@
+#!/bin/bash
+for p in steam steamwebhelper lutris heroic wine64-preloader wineserver \
+         retroarch gamescope; do
+    if pgrep -ix "$p" >/dev/null 2>&1; then
+        echo "NiiX update gate: '$p' is running - skipping this update cycle"
+        exit 1
+    fi
+done
+exit 0

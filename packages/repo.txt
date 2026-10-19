@@ -1,0 +1,175 @@
+# NiiX Arch - packages from the repositories (Arch + CachyOS).
+# Every NiiX system has exactly these: the ISO is built from this list and
+# the installer copies the ISO.
+#   name     a package            ?name   only if the repos have it right now
+#   @group   a whole group        !name   ...except this member
+#
+# Base system, kernel and boot
+base
+base-devel
+linux-cachyos
+linux-cachyos-headers
+linux-firmware
+amd-ucode
+intel-ucode
+limine
+efibootmgr
+cryptsetup
+btrfs-progs
+dosfstools
+e2fsprogs
+exfatprogs
+ntfs-3g
+ntfsprogs
+mtools
+sudo
+nano
+git
+wget
+curl
+rsync
+squashfs-tools
+unzip
+python
+pciutils
+dmidecode
+iio-sensor-proxy
+arch-install-scripts
+parted
+gptfdisk
+reflector
+pacman-contrib
+fwupd
+snapper
+snap-pac
+zram-generator
+irqbalance
+ananicy-cpp
+cachyos-ananicy-rules
+power-profiles-daemon
+ufw
+dnsmasq
+
+# Package sources and helpers
+cachyos-keyring
+cachyos-mirrorlist
+cachyos-v3-mirrorlist
+cachyos-v4-mirrorlist
+chwd
+yay
+flatpak
+
+# Network, sound, Bluetooth
+networkmanager
+wpa_supplicant
+iw
+wireless-regdb
+ethtool
+pipewire
+pipewire-alsa
+pipewire-pulse
+wireplumber
+bluez
+bluez-utils
+
+# Graphics: the open drivers of every vendor (NVIDIA's own driver is added
+# for the hardware found, see install_nvidia_driver)
+mesa
+lib32-mesa
+vulkan-icd-loader
+lib32-vulkan-icd-loader
+vulkan-intel
+lib32-vulkan-intel
+intel-media-driver
+vulkan-radeon
+lib32-vulkan-radeon
+vulkan-nouveau
+lib32-vulkan-nouveau
+vulkan-tools
+libva-utils
+xorg-xwayland
+
+# Desktop (GNOME without its tour, browser, maps and the like - Papers is the
+# PDF viewer, so Evince isn't needed; no first-login wizard)
+@gnome
+!gnome-tour
+!epiphany
+!gnome-maps
+!gnome-contacts
+!gnome-characters
+!gnome-connections
+!gnome-font-viewer
+!simple-scan
+!yelp
+!gnome-user-share
+!gnome-color-manager
+!evince
+!gnome-initial-setup
+gdm
+gnome-terminal
+gnome-tweaks
+gnome-menus
+gnome-disk-utility
+gnome-text-editor
+gnome-shell-extensions
+gnome-shell-extension-appindicator
+gnome-shell-extension-dash-to-panel
+gnome-shell-extension-arc-menu
+dconf
+gvfs
+gvfs-mtp
+gvfs-gphoto2
+gvfs-afc
+gvfs-smb
+udisks2
+xdg-user-dirs
+zenity
+libnotify
+python-evdev
+python-gobject
+python-cairo
+gtk4
+fastfetch
+
+# Fonts: without these, Chinese/Japanese/Korean text, emoji and many other
+# scripts show as empty boxes (wqy-zenhei is the CJK font Wine games pick up)
+ttf-hack-nerd
+noto-fonts
+noto-fonts-cjk
+noto-fonts-emoji
+wqy-zenhei
+
+# Gaming
+steam
+lutris
+gamemode
+lib32-gamemode
+mangohud
+lib32-mangohud
+gamescope
+wine
+winetricks
+vkd3d
+lib32-vkd3d
+proton-cachyos-slr
+umu-launcher
+scx-scheds
+?scx-tools
+lib32-alsa-plugins
+lib32-libpulse
+?lib32-openal
+?lib32-gst-plugins-base
+?lib32-gst-plugins-good
+
+# VR: the OpenXR loader, and adb + udev rules for Quest/Pico headsets on a
+# USB cable (WiVRn streams over USB as well as Wi-Fi). WiVRn and xrizer are
+# in the AUR list below; SteamVR comes from Steam when it is wanted.
+openxr
+android-tools
+android-udev
+
+# Apps
+vlc
+filezilla
+libreoffice-fresh
+signal-desktop

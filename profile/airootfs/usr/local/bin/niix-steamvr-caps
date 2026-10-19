@@ -1,0 +1,12 @@
+#!/bin/sh
+# NiiX: gives SteamVR's compositor CAP_SYS_NICE (asynchronous reprojection),
+# as SteamVR's own password prompt would. Run by niix-steamvr-caps.path.
+# Usage: niix-steamvr-caps USER
+user=$1
+home=$(getent passwd "$user" | cut -d: -f6)
+[ -n "$home" ] || exit 0
+f="$home/.local/share/Steam/steamapps/common/SteamVR/bin/linux64/vrcompositor-launcher"
+[ -f "$f" ] && [ ! -L "$f" ] || exit 0
+[ "$(stat -c %U "$f")" = "$user" ] || exit 0
+getcap "$f" | grep -q cap_sys_nice && exit 0
+setcap CAP_SYS_NICE=eip "$f" && echo "SteamVR compositor: CAP_SYS_NICE set"

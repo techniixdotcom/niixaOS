@@ -1,0 +1,12 @@
+#!/bin/sh
+# Makes the system call itself NiiX Arch (os-release, login banner). Run when
+# the ISO is built and again by a pacman hook whenever 'filesystem' updates.
+set -e
+src=/usr/lib/os-release
+[ -r "$src" ] || exit 0
+sed -e 's/^NAME=.*/NAME="NiiX Arch"/' -e 's/^PRETTY_NAME=.*/PRETTY_NAME="NiiX Arch"/' -e '/^LOGO=/d' "$src" > /etc/os-release.tmp
+echo 'LOGO=niixarch-logo' >> /etc/os-release.tmp
+mv -f /etc/os-release.tmp /etc/os-release
+chmod 644 /etc/os-release
+printf '%s\n\n' 'NiiX Arch \r (\l)' > /etc/issue
+printf '\n  Welcome to NiiX Arch\n  Run '"'"'fastfetch'"'"' for system info.\n\n' > /etc/motd

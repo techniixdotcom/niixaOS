@@ -1,0 +1,2 @@
+# Controller-as-mouse (niix-padnav) and Steam Input write through uinput.
+KERNEL=="uinput", SUBSYSTEM=="misc", TAG+="uaccess", OPTIONS+="static_node=uinput"

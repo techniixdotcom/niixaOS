@@ -1,0 +1,10 @@
+[Unit]
+Description=Watch app directories for NiiX icon generation
+
+[Path]
+PathChanged=/var/lib/flatpak/exports/share/applications
+PathChanged=/usr/local/share/applications
+Unit=niix-iconify.service
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,15 @@
+[Unit]
+Description=NiiX: mount internal NTFS volumes under /media
+Documentation=man:niix-ntfs
+After=local-fs.target
+Wants=local-fs.target
+ConditionPathExists=/usr/local/bin/niix-ntfs
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/niix-ntfs mount
+RemainAfterExit=no
+TimeoutStartSec=300
+
+[Install]
+WantedBy=multi-user.target

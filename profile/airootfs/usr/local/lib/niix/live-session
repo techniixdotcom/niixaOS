@@ -1,0 +1,6 @@
+#!/bin/bash
+# Live session login: let the installer icon on the desktop launch without
+# GNOME asking first. (The panel layout is kept by niix-panel-fix's own
+# autostart entry, as on an installed system.)
+gio set "$HOME/Desktop/org.niixa.Installer.desktop" metadata::trusted true 2>/dev/null
+exit 0

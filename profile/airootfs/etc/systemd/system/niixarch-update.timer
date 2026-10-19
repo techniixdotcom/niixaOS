@@ -1,0 +1,11 @@
+[Unit]
+Description=NiiX Arch Update Timer (every 12h)
+
+[Timer]
+OnBootSec=15min
+OnUnitActiveSec=12h
+Persistent=true
+RandomizedDelaySec=30min
+
+[Install]
+WantedBy=timers.target
