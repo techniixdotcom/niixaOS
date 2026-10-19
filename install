@@ -81,7 +81,7 @@ LOCALE="en_GB.UTF-8"
 MAPPER="cryptroot"
 BTRFS_OPTS="noatime,compress=zstd,space_cache=v2"
 NIIX_MIN_GIB=40    # smallest space NiiX is installed into (system ~20 GB, the rest for games)
-NIIX_BUILD="2026-10-19-r57"  # bump on every change - printed on the banner to verify freshness
+NIIX_BUILD="2026-10-19-r59"  # bump on every change - printed on the banner to verify freshness
 
 # -- Install mode ---------------------------------------------
 INSTALL_MODE=""    # "dualboot" | "singleboot"
@@ -1046,7 +1046,7 @@ from gi.repository import Gio, GLib
 BUS_NAME = "org.gnome.Mutter.DisplayConfig"
 OBJ_PATH = "/org/gnome/Mutter/DisplayConfig"
 STATE_DIR = os.path.join(os.environ.get("XDG_STATE_HOME") or os.path.expanduser("~/.local/state"), "niix")
-STATE_FILE = os.path.join(STATE_DIR, "display-setup.json")
+STATE_FILE = os.path.join(STATE_DIR, "display-setup-v2.json")
 CONF_FILE = "/etc/niix/display.conf"
 GPU_STATE = "/run/niix/gpu.state"
 
@@ -1112,10 +1112,24 @@ def monitor_key(spec, modes):
 
 # -- What the monitor itself says it can do (EDID) ---------------------------
 
+def sysfs_connectors(connector):
+    """The connector's folders in /sys/class/drm. Mutter and the kernel name
+    most ports the same (DP-1, eDP-1), but HDMI differs: Mutter's HDMI-1 is
+    the kernel's HDMI-A-1 (HDMI-B on the rare type B port)."""
+    names = [connector]
+    kind, _, number = connector.rpartition("-")
+    if kind == "HDMI" and number.isdigit():
+        names += ["HDMI-A-" + number, "HDMI-B-" + number]
+    paths = []
+    for name in names:
+        paths += glob.glob("/sys/class/drm/card*-%s" % name)
+    return paths
+
+
 def edid_max_refresh(connector):
     """Highest refresh rate in the monitor's EDID range-limits block, or 0."""
     best = 0
-    for path in glob.glob("/sys/class/drm/card*-%s/edid" % connector):
+    for path in [os.path.join(p, "edid") for p in sysfs_connectors(connector)]:
         try:
             with open(path, "rb") as fh:
                 edid = fh.read()
@@ -1133,7 +1147,7 @@ def edid_max_refresh(connector):
 
 def connector_info(connector):
     """(driver name, PCI slot) of the GPU this connector belongs to."""
-    for path in glob.glob("/sys/class/drm/card*-%s" % connector):
+    for path in sysfs_connectors(connector):
         card = os.path.basename(path).split("-", 1)[0]
         dev = os.path.realpath("/sys/class/drm/%s/device" % card)
         driver = ""
@@ -1168,6 +1182,45 @@ def why_only_60(connector, best_rate):
             "cable (DisplayPort 1.4 or newer) or another port on the graphics card." % round(best_rate))
 
 
+def native_held_back(connector, native_w, native_h, native_rate, fast):
+    """Why native resolution runs at 60 Hz while a lower one gets the high rate."""
+    driver, slot = connector_info(connector)
+    strong = forced_gpu_slot()
+    lower = "%dx%d at %.0f Hz" % (fast[1], fast[2], fast[3])
+    if strong and slot and slot != strong:
+        return ("This monitor is plugged into the motherboard. Plug it into the "
+                "graphics card's ports instead - that also makes games much faster.")
+    if connector.startswith("HDMI") and driver in ("amdgpu", "radeon"):
+        return ("%dx%d only runs at %.0f Hz over HDMI: AMD's Linux driver has no HDMI 2.1, "
+                "and HDMI 2.0 can't carry more. Use a DisplayPort cable for the full refresh "
+                "rate at %dx%d - or pick %s in Settings -> Displays."
+                % (native_w, native_h, native_rate, native_w, native_h, lower))
+    if connector.startswith("HDMI"):
+        return ("%dx%d only runs at %.0f Hz on this HDMI link. Higher needs the monitor's "
+                "HDMI 2.1 port and an 'Ultra High Speed' cable - or use DisplayPort. Until "
+                "then, %s is available in Settings -> Displays."
+                % (native_w, native_h, native_rate, lower))
+    return ("%dx%d only runs at %.0f Hz on this link. Try a DisplayPort 1.4 (or newer) "
+            "cable, or another port on the graphics card - or pick %s in Settings -> Displays."
+            % (native_w, native_h, native_rate, lower))
+
+
+def refresh_problem(connector, modes):
+    """(title, explanation) when the monitor can't reach its refresh rate here, else None."""
+    if not modes:
+        return None
+    fastest = max(modes, key=lambda m: m[3])
+    capable = edid_max_refresh(connector)
+    if capable >= 100 and fastest[3] < 75:
+        return ("limited to %.0f Hz" % fastest[3],
+                "This monitor supports up to %d Hz. %s" % (capable, why_only_60(connector, fastest[3])))
+    native = best_mode(modes, False)
+    if native and native[3] < 75 and fastest[3] >= 100:
+        return ("at %.0f Hz at full resolution" % native[3],
+                native_held_back(connector, native[1], native[2], native[3], fastest))
+    return None
+
+
 # -- Choosing the mode ----------------------------------------------------------
 
 def current_mode(modes):
@@ -1182,11 +1235,20 @@ def best_mode(modes, want_vrr):
     """Native resolution at the highest refresh; the VRR variant if wanted."""
     if not modes:
         return None
-    # Native is normally the preferred mode's size, but a few monitors mark a
-    # smaller mode as preferred - the biggest size wins then.
+    # Native is the preferred mode's size. Many 1080p/1440p high-refresh
+    # monitors also accept a bigger 4K signal at 60 Hz and scale it down -
+    # that bigger size is NOT native and must never cost refresh rate. A
+    # bigger size only wins when it runs at least as fast.
+    def top(size):
+        rates = [m[3] for m in modes if (m[1], m[2]) == size and not m[6].get("is-interlaced", False)]
+        return max(rates, default=0)
+
     biggest = max(modes, key=lambda m: m[1] * m[2])
     preferred = next((m for m in modes if m[6].get("is-preferred", False)), biggest)
-    ref = biggest if biggest[1] * biggest[2] > preferred[1] * preferred[2] else preferred
+    ref = preferred
+    if (biggest[1] * biggest[2] > preferred[1] * preferred[2]
+            and top((biggest[1], biggest[2])) >= top((preferred[1], preferred[2])) - 0.5):
+        ref = biggest
     same_size = [m for m in modes if m[1] == ref[1] and m[2] == ref[2]
                  and not m[6].get("is-interlaced", False)]
     if not same_size:
@@ -1300,6 +1362,7 @@ class Display:
             if pick and (current is None or pick[0] != current[0]):
                 changes[spec[0]] = pick
 
+        failed = set()
         if changes:
             layout = build_layout(logical, by_connector, changes)
             if layout and self.try_apply(serial, layout, props.get("layout-mode", 1)):
@@ -1307,20 +1370,24 @@ class Display:
                     log("%s -> %dx%d @ %.2f Hz%s" % (conn, mode[1], mode[2], mode[3],
                                                      ", VRR on" if is_vrr(mode) else ""))
             else:
-                log("could not switch modes - leaving the monitors as GNOME set them")
+                # Not marked as set up: tried again at the next monitor
+                # change and at the next login, instead of never.
+                failed = set(changes)
+                log("could not switch %s - trying again later" % ", ".join(sorted(failed)))
 
         for key, spec, modes, mprops in new:
             connector = spec[0]
+            if connector in failed:
+                continue
             fastest = max((m[3] for m in modes), default=0)
             capable = edid_max_refresh(connector)
             saved[key] = {"connector": connector, "max_offered": round(fastest, 2),
                           "edid_max": capable}
-            if capable >= 100 and fastest < 75:
+            problem = refresh_problem(connector, modes)
+            if problem:
                 name = mprops.get("display-name", connector)
-                reason = why_only_60(connector, fastest)
-                log("%s can do %d Hz but only %.0f Hz is offered: %s" % (name, capable, fastest, reason))
-                notify("%s is limited to %.0f Hz" % (name, fastest),
-                       "This monitor supports up to %d Hz. %s" % (capable, reason))
+                log("%s is %s: %s" % (name, problem[0], problem[1]))
+                notify("%s is %s" % (name, problem[0]), problem[1])
         save_state(saved)
 
     def status(self):
@@ -1342,8 +1409,9 @@ class Display:
                 print("  monitor     up to %d Hz (EDID)" % capable)
             print("  GPU         %s %s" % (driver or "?", slot))
             print("  set up      %s" % ("yes" if monitor_key(spec, modes) in saved else "not yet"))
-            if capable >= 100 and fastest < 75:
-                print("  !           " + why_only_60(connector, fastest))
+            problem = refresh_problem(connector, modes)
+            if problem:
+                print("  !           " + problem[1])
             print()
 
     def watch(self):
@@ -1375,7 +1443,7 @@ def main():
         display = Display()
     except GLib.Error as exc:
         log("GNOME display service not reachable: %s" % exc.message)
-        sys.exit(0 if cmd == "watch" else 1)
+        sys.exit(1)    # the service retries; GNOME may not be up yet
     if cmd == "watch":
         display.watch()
     elif cmd == "status":
