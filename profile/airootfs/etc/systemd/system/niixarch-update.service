@@ -1,0 +1,22 @@
+[Unit]
+Description=NiiX Arch System Update
+Wants=network-online.target
+After=network-online.target
+# A laptop running flat mid-update can leave a half-installed kernel.
+ConditionACPower=true
+
+[Service]
+Type=oneshot
+# Skipped (not failed) while a game is running.
+ExecCondition=/usr/local/bin/niix-update-gate
+# No shutdown or suspend from the desktop while packages are installed. A
+# shutdown that happens anyway only interrupts pacman before it starts
+# installing (SIGINT - pacman refuses it once it has begun) and waits for it
+# to finish: the 15 s default of 90-niix-timeouts.conf would kill it halfway
+# and leave a system that does not boot.
+ExecStart=/usr/bin/systemd-inhibit --what=shutdown:sleep --who="NiiX update" --why="Installing system updates" --mode=block /usr/bin/pacman -Syu --noconfirm
+KillSignal=SIGINT
+TimeoutStopSec=30min
+# Out of the way of games and the desktop.
+Nice=10
+IOSchedulingClass=idle

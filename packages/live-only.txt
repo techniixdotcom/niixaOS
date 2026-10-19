@@ -1,0 +1,4 @@
+# Only the live ISO needs these; the installer removes them from the new
+# system (they are also listed in profile/airootfs/usr/local/lib/niix/live-files).
+mkinitcpio-archiso
+pv

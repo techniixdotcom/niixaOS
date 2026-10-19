@@ -1,0 +1,12 @@
+# NiiX Arch - packages from the AUR, built into the ISO (unless CachyOS's
+# repositories carry them - then that signed build is used). Installed
+# systems keep them updated with yay (niix-update).
+#   name                 one AUR package
+#   base=pkg,pkg,...     an AUR package that builds several packages
+helium-browser-bin
+gnome-shell-extension-ddterm
+game-devices-udev
+xpadneo-dkms
+dxvk-bin
+wivrn-server=wivrn-server,lib32-wivrn-server,wivrn-dashboard
+xrizer=xrizer,xrizer-common,lib32-xrizer

@@ -1,0 +1,6 @@
+[Desktop Entry]
+Type=Application
+Name=Steam (pre-load, minimized)
+Comment=Added by NiiX - delete this file to disable
+Exec=/usr/local/bin/niix-steam-warmstart
+X-GNOME-Autostart-enabled=true

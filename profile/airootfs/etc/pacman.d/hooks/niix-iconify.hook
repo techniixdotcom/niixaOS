@@ -1,0 +1,11 @@
+[Trigger]
+Operation = Install
+Operation = Upgrade
+Type = Path
+Target = usr/share/applications/*.desktop
+Target = usr/local/share/applications/*.desktop
+
+[Action]
+Description = Generating NiiX icons for new apps...
+When = PostTransaction
+Exec = /usr/local/bin/niix-iconify --quiet

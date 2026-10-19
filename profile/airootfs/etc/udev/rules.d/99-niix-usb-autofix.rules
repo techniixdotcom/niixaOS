@@ -1,0 +1,5 @@
+# Repair a dirty USB filesystem the moment it is plugged in, before udisks
+# mounts it - otherwise it mounts read-only and copying to it fails.
+# "add" only, so an already-mounted filesystem is never touched. The helper
+# checks before it writes and gives up rather than blocking a udev worker.
+ACTION=="add", SUBSYSTEM=="block", ENV{ID_BUS}=="usb", ENV{ID_FS_USAGE}=="filesystem", ENV{ID_FS_TYPE}=="ntfs|vfat|exfat", RUN+="/usr/bin/timeout 55 /usr/local/bin/niix-usb-autofix $env{DEVNAME} $env{ID_FS_TYPE}"

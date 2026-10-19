@@ -1,0 +1,10 @@
+[Trigger]
+Operation = Install
+Operation = Upgrade
+Type = Package
+Target = limine
+
+[Action]
+Description = Updating the Limine EFI files...
+When = PostTransaction
+Exec = /bin/sh -c '[ -d /boot/EFI/limine ] || exit 0; cp /usr/share/limine/BOOTX64.EFI /boot/EFI/limine/ && cp /usr/share/limine/BOOTX64.EFI /boot/EFI/BOOT/'

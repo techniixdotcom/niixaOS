@@ -1,0 +1,6 @@
+[Desktop Entry]
+Type=Application
+Name=NiiX live session
+Exec=/usr/local/lib/niix/live-session
+NoDisplay=true
+X-GNOME-Autostart-enabled=true

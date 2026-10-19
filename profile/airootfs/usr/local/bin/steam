@@ -1,0 +1,26 @@
+#!/bin/bash
+# NiiX's Steam: a one-time first-launch notice, then the real Steam with
+# niix-gpu's settings (the session has them already, but not a TTY or a
+# login from before niix-gpu changed its choice).
+# Remove with: sudo rm /usr/local/bin/steam /usr/local/share/applications/steam.desktop
+run_steam() { exec /usr/local/bin/niix-gpu run /usr/bin/steam "$@"; }
+
+for arg in "$@"; do
+    [ "$arg" = "-silent" ] && run_steam "$@"
+done
+STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/niix"
+FLAG="$STATE_DIR/steam-notice-shown"
+if [ ! -e "$FLAG" ]; then
+    mkdir -p "$STATE_DIR" && touch "$FLAG"
+    MSG="This first time, Steam downloads its client before it opens - a small window shows the progress. It takes a few minutes, depending on the connection.
+
+One-time setup for the best experience: in Steam go to Settings -> Compatibility, turn on \"Enable Steam Play for all other titles\", and pick Proton-CachyOS (already installed; GE-Proton is there too as an alternative) as the default tool. Steam will restart once.
+
+Tip: NiiX pre-loads Steam in the background shortly after each login, so future launches are much faster."
+    if command -v zenity >/dev/null 2>&1; then
+        zenity --info --title="Steam is starting..." --width=420 --text="$MSG" &
+    elif command -v notify-send >/dev/null 2>&1; then
+        notify-send -u normal "Steam is starting..." "$MSG" &
+    fi
+fi
+run_steam "$@"

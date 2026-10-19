@@ -1,0 +1,269 @@
+#!/bin/bash
+# niix-ntfs - internal NTFS volumes, mounted under /media and usable as is.
+#
+#   niix-ntfs mount        mount every internal NTFS volume (the default)
+#   niix-ntfs status       what is mounted and how
+#   niix-ntfs umount-all   unmount everything this tool mounted
+#   niix-ntfs list         the NTFS volumes found, and why any are skipped
+#
+# Runs at boot and when a disk appears (niix-ntfs-mount.service and udev).
+# Removable media are left to GNOME/udisks2. Settings: /etc/niix-ntfs.conf
+set -uo pipefail
+
+ENABLED=1
+MOUNT_ROOT=/media
+NTFS_UID=""
+NTFS_GID=""
+NTFS_UMASK=0022
+EXCLUDE_UUIDS=""
+INCLUDE_REMOVABLE=0
+EXTRA_OPTIONS=""
+WINDOWS_RW=0
+CONF=/etc/niix-ntfs.conf
+# shellcheck source=/dev/null
+[ -r "$CONF" ] && . "$CONF"
+
+STATE_DIR=/run/niix-ntfs
+LOCKFILE=/run/lock/niix-ntfs.lock
+ACTION="${1:-mount}"
+
+msg()  { printf '%s\n' "$*"; }
+warn() { printf 'warning: %s\n' "$*" >&2; }
+
+need_root() {
+    [ "$(id -u)" -eq 0 ] || { echo "niix-ntfs $ACTION must run as root (try: sudo niix-ntfs $ACTION)" >&2; exit 1; }
+}
+
+# The lowest regular account: the user the installer created.
+resolve_owner() {
+    local u
+    if [ -z "$NTFS_UID" ]; then
+        u=$(getent passwd | awk -F: '$3>=1000 && $3<65000 {print $3}' | sort -n | head -1)
+        NTFS_UID="${u:-0}"
+    fi
+    if [ -z "$NTFS_GID" ]; then
+        NTFS_GID=$(getent passwd | awk -F: -v u="$NTFS_UID" '$3==u {print $4; exit}')
+        NTFS_GID="${NTFS_GID:-$NTFS_UID}"
+    fi
+}
+
+# USB, SD and FireWire media are udisks2's job.
+disk_is_removable() {
+    local disk="$1" tran
+    [ -n "$disk" ] || return 1
+    [ "$(cat "/sys/block/$disk/removable" 2>/dev/null)" = "1" ] && return 0
+    tran=$(lsblk -dno TRAN "/dev/$disk" 2>/dev/null | tr -d ' ')
+    case "$tran" in usb|mmc|ieee1394) return 0 ;; esac
+    return 1
+}
+
+sanitize() {
+    printf '%s' "$1" \
+        | tr -c 'A-Za-z0-9._ -' '_' \
+        | sed -e 's/^[ .]*//' -e 's/[ ]*$//' -e 's/ \+/_/g' \
+        | cut -c1-48
+}
+
+excluded() {
+    local uuid="$1" x
+    for x in $EXCLUDE_UUIDS; do
+        [ "$x" = "$uuid" ] && return 0
+    done
+    return 1
+}
+
+# Every NTFS partition on the machine, one device path per line.
+ntfs_parts() {
+    local dev
+    while IFS= read -r dev; do
+        [ -b "$dev" ] || continue
+        [ "$(blkid -s TYPE -o value "$dev" 2>/dev/null)" = "ntfs" ] && printf '%s\n' "$dev"
+    done < <(lsblk -lno PATH,TYPE 2>/dev/null | awk '$2=="part"{print $1}')
+}
+
+# Why a volume is skipped, or nothing when it gets mounted.
+skip_reason() {
+    local dev="$1" uuid="$2" parent
+    [ -n "$uuid" ] || { echo "no UUID"; return; }
+    excluded "$uuid" && { echo "excluded in $CONF"; return; }
+    parent=$(lsblk -no PKNAME "$dev" 2>/dev/null | head -1 | tr -d ' ')
+    if [ "$INCLUDE_REMOVABLE" != "1" ] && disk_is_removable "$parent"; then
+        echo "removable - handled by GNOME/udisks2"
+        return
+    fi
+    if grep -qsE "^[^#]*\\b(UUID=)?$uuid\\b" /etc/fstab; then
+        echo "already in /etc/fstab"
+        return
+    fi
+    if findmnt -rn -S "$dev" >/dev/null 2>&1; then
+        echo "already mounted at $(findmnt -rn -o TARGET -S "$dev" | head -1)"
+        return
+    fi
+}
+
+# Mounts the volume read-only for a moment and sets PROBE_WINDOWS (it holds
+# \Windows\System32) and PROBE_NAME: the label, else "Windows" or NTFS-<uuid>,
+# with the UUID added when the name is taken.
+probe_volume() {
+    local dev="$1" uuid="$2" label probe
+    PROBE_WINDOWS=false
+    probe="$STATE_DIR/probe"
+    mkdir -p "$probe"
+    if mount -t ntfs3 -o ro "$dev" "$probe" 2>/dev/null 9>&- \
+        || mount -t ntfs-3g -o ro "$dev" "$probe" 2>/dev/null 9>&-; then
+        [ -d "$probe/Windows/System32" ] && PROBE_WINDOWS=true
+        umount "$probe" 2>/dev/null
+    fi
+    rmdir "$probe" 2>/dev/null
+
+    label=$(blkid -s LABEL -o value "$dev" 2>/dev/null)
+    PROBE_NAME=$(sanitize "$label")
+    if [ -z "$PROBE_NAME" ]; then
+        if [ "$PROBE_WINDOWS" = true ]; then
+            PROBE_NAME=Windows
+        else
+            PROBE_NAME="NTFS-${uuid:0:8}"
+        fi
+    fi
+    if [ -e "$MOUNT_ROOT/$PROBE_NAME" ]; then
+        if ! [ -d "$MOUNT_ROOT/$PROBE_NAME" ] || [ -n "$(ls -A "$MOUNT_ROOT/$PROBE_NAME" 2>/dev/null)" ]; then
+            PROBE_NAME="${PROBE_NAME}-${uuid:0:8}"
+        fi
+    fi
+}
+
+# mount_one DEVICE TARGET [ro]: read-write with ntfs3, then ntfs-3g, then
+# read-only. Both drivers refuse to write a volume Windows left hibernated,
+# so that one ends up read-only, which is the safe outcome.
+mount_one() {
+    local dev="$1" target="$2" want="${3:-rw}" common driver=""
+    common="noatime,nosuid,nodev,uid=$NTFS_UID,gid=$NTFS_GID,umask=$NTFS_UMASK,windows_names"
+    [ -n "$EXTRA_OPTIONS" ] && common="$common,$EXTRA_OPTIONS"
+
+    # 9>&- on every mount: the ntfs-3g daemon lives as long as the mount and
+    # would otherwise keep the lock fd, deadlocking every later run.
+    if [ "$want" != ro ] && mount -t ntfs3 -o "rw,$common" "$dev" "$target" 2>/dev/null 9>&-; then
+        driver=ntfs3
+    elif [ "$want" != ro ] && mount -t ntfs-3g -o "rw,$common" "$dev" "$target" 2>/dev/null 9>&-; then
+        driver=ntfs-3g
+    elif mount -t ntfs3 -o "ro,$common" "$dev" "$target" 2>/dev/null 9>&-; then
+        driver=ntfs3
+    elif mount -t ntfs-3g -o "ro,$common" "$dev" "$target" 2>/dev/null 9>&-; then
+        driver=ntfs-3g
+    else
+        warn "could not mount $dev - see: dmesg | tail"
+        return 1
+    fi
+
+    # Asking for rw doesn't always get it: hibernated or dirty volumes, or
+    # read-only hardware.
+    if [ "$want" = ro ]; then
+        msg "mounted $dev -> $target ($driver, read-only: Windows system drive)"
+        msg "  Protects Windows from accidental changes. To allow writing, set"
+        msg "  WINDOWS_RW=1 in $CONF (Fast Startup must be off in Windows)."
+    elif findmnt -rn -o OPTIONS -M "$target" 2>/dev/null | grep -qE '(^|,)ro(,|$)'; then
+        msg "mounted $dev -> $target ($driver, READ-ONLY)"
+        msg "  Writing is blocked because the volume is hibernated, was not shut down"
+        msg "  cleanly, or the disk itself is read-only. In Windows turn off Fast Startup"
+        msg "  (Power Options > Choose what the power buttons do) and shut down fully."
+        msg "  Check/repair from here: sudo ntfsfix $dev"
+    else
+        msg "mounted $dev -> $target ($driver, read-write)"
+    fi
+    return 0
+}
+
+do_mount() {
+    need_root
+    [ "$ENABLED" = "1" ] || { msg "disabled in $CONF"; return 0; }
+    resolve_owner
+    mkdir -p "$MOUNT_ROOT" "$STATE_DIR"
+    local dev uuid reason target want mounted=0
+
+    while IFS= read -r dev; do
+        uuid=$(blkid -s UUID -o value "$dev" 2>/dev/null)
+        reason=$(skip_reason "$dev" "$uuid")
+        [ -n "$reason" ] && continue
+        probe_volume "$dev" "$uuid"
+        target="$MOUNT_ROOT/$PROBE_NAME"
+        want=rw
+        [ "$PROBE_WINDOWS" = true ] && [ "$WINDOWS_RW" != "1" ] && want=ro
+        mkdir -p "$target" || { warn "could not create $target"; continue; }
+        if mount_one "$dev" "$target" "$want"; then
+            printf '%s\n' "$target" >> "$STATE_DIR/mounts"
+            mounted=$((mounted + 1))
+        else
+            rmdir "$target" 2>/dev/null
+        fi
+    done < <(ntfs_parts)
+
+    [ "$mounted" -eq 0 ] && msg "no new NTFS volumes to mount"
+    return 0
+}
+
+do_list() {
+    local dev uuid label reason found=0
+    printf '%-12s %-18s %-18s %s\n' DEVICE LABEL UUID STATUS
+    while IFS= read -r dev; do
+        found=1
+        uuid=$(blkid -s UUID -o value "$dev" 2>/dev/null)
+        label=$(blkid -s LABEL -o value "$dev" 2>/dev/null)
+        reason=$(skip_reason "$dev" "$uuid")
+        printf '%-12s %-18s %-18s %s\n' "$dev" "${label:-(no label)}" "$uuid" "${reason:-will be mounted under $MOUNT_ROOT}"
+    done < <(ntfs_parts)
+    [ "$found" -eq 0 ] && msg "no NTFS volumes found"
+    return 0
+}
+
+do_status() {
+    local any=0 line
+    while IFS= read -r line; do
+        any=1; printf '%s\n' "$line"
+    done < <(findmnt -rn -t ntfs3,ntfs-3g,ntfs,fuseblk -o SOURCE,TARGET,FSTYPE,OPTIONS 2>/dev/null \
+             | awk '{printf "%-14s %-28s %-8s %s\n", $1, $2, $3, ($4 ~ /(^|,)ro(,|$)/ ? "read-only" : "read-write")}')
+    [ "$any" -eq 0 ] && msg "no NTFS volumes mounted"
+    return 0
+}
+
+do_umount_all() {
+    need_root
+    local target
+    [ -s "$STATE_DIR/mounts" ] || { msg "nothing mounted by niix-ntfs"; return 0; }
+    while IFS= read -r target; do
+        [ -n "$target" ] || continue
+        if mountpoint -q "$target"; then
+            if umount "$target" 2>/dev/null; then
+                msg "unmounted $target"
+            else
+                warn "$target is busy - close anything using it (lsof +f -- $target)"
+                continue
+            fi
+        fi
+        rmdir "$target" 2>/dev/null
+    done < "$STATE_DIR/mounts"
+    : > "$STATE_DIR/mounts"
+    return 0
+}
+
+case "$ACTION" in
+    mount)
+        # Not on the live ISO: the installer may be repartitioning these drives.
+        [ -e /etc/niix-live ] && exit 0
+        # Serialise: udev can fire several times while disks are being probed.
+        mkdir -p "$(dirname "$LOCKFILE")"
+        exec 9>"$LOCKFILE" || exit 1
+        # Give up rather than hang the boot service if another run is stuck.
+        if ! flock -w 120 9; then
+            echo "niix-ntfs: another run is in progress - skipping" >&2
+            exit 0
+        fi
+        do_mount
+        ;;
+    list)       do_list ;;
+    status)     do_status ;;
+    umount-all) do_umount_all ;;
+    *)
+        echo "Usage: niix-ntfs {mount|list|status|umount-all}"
+        exit 1
+        ;;
+esac

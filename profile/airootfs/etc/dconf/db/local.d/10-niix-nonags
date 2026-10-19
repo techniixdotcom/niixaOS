@@ -1,0 +1,6 @@
+[org/gnome/settings-daemon/plugins/housekeeping]
+donation-reminder-enabled=false
+
+[org/gnome/shell/extensions/arcmenu]
+update-notifier-enabled=false
+update-notifier-project-version=2147483647

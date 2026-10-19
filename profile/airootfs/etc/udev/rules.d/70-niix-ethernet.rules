@@ -1,0 +1,1 @@
+ACTION=="add", SUBSYSTEM=="net", KERNEL=="en*|eth*", RUN+="/usr/bin/ethtool --set-eee %k eee off"

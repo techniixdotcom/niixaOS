@@ -1,0 +1,12 @@
+# Build time only: finishes the image after mkarchiso installed the packages
+# (gnome-shell is always part of that one transaction). Removes itself.
+[Trigger]
+Operation = Install
+Type = Package
+Target = gnome-shell
+
+[Action]
+Description = Finishing the NiiX image...
+When = PostTransaction
+Depends = bash
+Exec = /usr/local/lib/niix-build/customize-image

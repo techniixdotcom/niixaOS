@@ -1,0 +1,26 @@
+#!/bin/bash
+# Hide one or more apps from the menu (does NOT uninstall). Reverse: niix-unhide-app
+#   niix-hide-app org.gnome.Tour gnome-system-monitor ...
+set -uo pipefail
+A="$HOME/.local/share/applications"; mkdir -p "$A"
+[ $# -ge 1 ] || { echo "usage: niix-hide-app <desktop-id> [more...]"; exit 1; }
+for id in "$@"; do
+    id="${id%.desktop}"; src=""
+    for d in /usr/share/applications /usr/local/share/applications \
+             /var/lib/flatpak/exports/share/applications \
+             "$HOME/.local/share/flatpak/exports/share/applications"; do
+        [ -f "$d/$id.desktop" ] && { src="$d/$id.desktop"; break; }
+    done
+    if [ -n "$src" ]; then
+        cp -f "$src" "$A/$id.desktop"
+        if grep -q '^NoDisplay=' "$A/$id.desktop"; then
+            sed -i 's/^NoDisplay=.*/NoDisplay=true/' "$A/$id.desktop"
+        else
+            sed -i '/^\[Desktop Entry\]/a NoDisplay=true' "$A/$id.desktop"
+        fi
+    else
+        printf '[Desktop Entry]\nType=Application\nName=%s\nNoDisplay=true\nHidden=true\n' "$id" > "$A/$id.desktop"
+    fi
+    echo "hidden: $id"
+done
+update-desktop-database "$A" 2>/dev/null || true
