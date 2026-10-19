@@ -62,11 +62,8 @@ grep -qx fastfetch /etc/skel/.bashrc || echo fastfetch >> /etc/skel/.bashrc
 
 # -- Files that packages own --------------------------------------------------------
 install -m 644 /usr/local/share/niix/bluetooth-main.conf /etc/bluetooth/main.conf
-if grep -q '^SNAPPER_CONFIGS=' /etc/conf.d/snapper 2>/dev/null; then
-    sed -i 's/^SNAPPER_CONFIGS=.*/SNAPPER_CONFIGS="root"/' /etc/conf.d/snapper
-else
-    mkdir -p /etc/conf.d && echo 'SNAPPER_CONFIGS="root"' >> /etc/conf.d/snapper
-fi
+# (Snapper's config list is set by the installer: snapshots of the live
+# image, or of the image while it's built, make no sense.)
 mkdir -p /etc/default
 printf 'SCX_SCHEDULER=scx_lavd\nSCX_FLAGS=\n' > /etc/default/scx
 

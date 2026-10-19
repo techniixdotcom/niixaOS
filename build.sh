@@ -47,6 +47,12 @@ fi
 ERR_RE='(^|[^a-z_-])(error|fatal|failed|failure|cannot|could not|unable to|no such host|timed out|timeout|permission denied|not found|corrupted|invalid)([^a-z_]|$)'
 ANSI_RE=$'\033''\[[0-9;?]*[A-Za-z]'
 NOISE_RE='(-werror|error\.(h|c|o)|errors=|0 errors|error_|_error|warning: )'
+# Known harmless, shown dimmed and kept out of the errors log:
+#   cmake's configure report (WiVRn lists the optional libraries it skips)
+#   install scripts that run before grep is in the new image (pacstrap order)
+#   mkarchiso listing packages with the image's pacman.conf but no keyring yet
+#   systemd-tmpfiles in a chroot without a booted /etc
+HARMLESS_RE='^(-- |  could not find a configuration file|  +the following configuration files were considered)|\.install: line [0-9]+: grep: command not found|keyring is not writable|public keyring not found|key "882dcfe48e2051d48e2562abf3b607488db35a47" is unknown|failed to resolve specifier: uninitialized /etc/'
 
 # logfilter : every line of the build goes through here as it happens -
 # timestamped into the log, coloured on screen, and error-looking lines also
@@ -63,6 +69,8 @@ logfilter() {
         if [[ "$plain" =~ ^==\>\ \[[0-9]+/[0-9]+\] ]]; then
             printf '%s\n' "$plain" > "$STEPFILE"
             printf '%s%s%s\n' "$C_STEP" "$plain" "$C_OFF"
+        elif [[ "$lower" =~ $HARMLESS_RE ]]; then
+            printf '%s%s%s\n' "$C_DIM" "$plain" "$C_OFF"
         elif [[ "$lower" =~ $ERR_RE && ! "$lower" =~ $NOISE_RE ]]; then
             step=$(cat "$STEPFILE" 2>/dev/null)
             printf '[%(%H:%M:%S)T] %s | %s\n' -1 "${step:-==> setup}" "$plain" >&4

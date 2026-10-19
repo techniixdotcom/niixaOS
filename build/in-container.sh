@@ -45,7 +45,7 @@ trap 'die "line $LINENO of build/in-container.sh: $BASH_COMMAND"' ERR
 
 # step TITLE FUNCTION : a numbered build step, timed. ../build.sh picks the
 # "==> [n/N]" lines up to say which step a failure happened in.
-STEP_N=0; STEP_TOTAL=11; STEP_NAME=""
+STEP_N=0; STEP_TOTAL=12; STEP_NAME=""
 step() {
     local title=$1 start=$SECONDS took
     shift
@@ -56,11 +56,17 @@ step() {
     printf '\033[38;5;118m    done in %dm %02ds\033[0m\n' $(( took / 60 )) $(( took % 60 ))
 }
 
+# retry CMD... : network commands, 5 tries, waiting longer each time
+# (15 s, 30 s, 60 s, 120 s) so a dropped connection or DNS hiccup can recover.
+# Package downloads resume: whatever finished stays in the cache.
 retry() {
-    local n
-    for n in 1 2 3; do
+    local n wait=15
+    for n in 1 2 3 4 5; do
         "$@" && return 0
-        (( n < 3 )) && { note "attempt $n failed - retrying in 15s: $*"; sleep 15; }
+        (( n < 5 )) || break
+        note "attempt $n of 5 failed - retrying in ${wait}s: ${*:0:6}..."
+        sleep "$wait"
+        wait=$(( wait * 2 ))
     done
     return 1
 }
@@ -70,6 +76,22 @@ retry() {
 [[ $EUID -eq 0 ]] || die "Run as root (inside the container)."
 
 # -- The container ------------------------------------------------------------
+# drop_cdn77 LIST... : cdn77.cachyos.org connects fast but 404s on single
+# packages, which costs every download a round of retries. Commented out,
+# unless it is a list's only server.
+drop_cdn77() {
+    local ml
+    for ml in "$@"; do
+        [[ -f "$ml" ]] || continue
+        grep -E '^[[:space:]]*Server' "$ml" | grep -vq 'cdn77\.cachyos\.org' || continue
+        sed -i -E 's|^([[:space:]]*Server[[:space:]]*=[[:space:]]*https?://cdn77\.cachyos\.org.*)|#\1|' "$ml"
+    done
+}
+
+# Git over flaky networks: give up on a stalled transfer after 30 s (then
+# retry) instead of waiting minutes for a TCP timeout.
+export GIT_HTTP_LOW_SPEED_LIMIT=1000 GIT_HTTP_LOW_SPEED_TIME=30
+
 fetch_key() {
     local server
     for server in hkps://keyserver.ubuntu.com hkps://keys.openpgp.org; do
@@ -96,6 +118,7 @@ prepare_container() {
         archiso git base-devel sudo curl python libarchive glib2 gtk-update-icon-cache reflector \
         cachyos-keyring cachyos-mirrorlist cachyos-v3-mirrorlist cachyos-v4-mirrorlist
     pacman-key --populate cachyos
+    drop_cdn77 /etc/pacman.d/cachyos-mirrorlist /etc/pacman.d/cachyos-v3-mirrorlist /etc/pacman.d/cachyos-v4-mirrorlist
     reflector --protocol https --age 12 --latest 25 --fastest 10 --save /etc/pacman.d/mirrorlist \
         || note "reflector failed - using the default mirrors"
     rm -rf "$WORK"
@@ -121,6 +144,45 @@ read_aur_list() {
     done < <(list "$REPO/packages/aur.txt")
 }
 
+# install_aur_deps DIR : installs, with retries, what makepkg -s will check
+# for the PKGBUILD in DIR (makepkg -s alone gives up on the first stalled
+# download). Only the pkgbase section counts - the per-package sections of
+# a split PKGBUILD name its own siblings (lib32-wivrn-server depends on
+# wivrn-server), which do not exist until this build makes them. Packages
+# built from the AUR earlier in this run come from the local repository.
+install_aur_deps() {
+    local dir=$1 f name dep
+    local -a wanted=() missing=() sync=() local_files=()
+    local -A own=() built=()
+    local srcinfo
+    srcinfo=$(sudo -u builder env -C "$dir" makepkg --printsrcinfo)
+    while IFS= read -r name; do own[$name]=1; done \
+        < <(awk -F' = ' '$1 == "pkgname" { print $2 }' <<< "$srcinfo")
+    mapfile -t wanted < <(awk -F' = ' '
+        $1 == "pkgname" { exit }
+        $1 ~ /^\t(make|check)?depends(_x86_64)?$/ { print $2 }' <<< "$srcinfo" | sort -u)
+    (( ${#wanted[@]} > 0 )) || return 0
+    # pacman -T prints the dependencies that are not satisfied yet.
+    mapfile -t missing < <(pacman -T "${wanted[@]}" || true)
+    (( ${#missing[@]} > 0 )) || return 0
+    for f in "$LOCALREPO"/*.pkg.tar.*; do
+        [[ -f "$f" && "$f" != *.sig ]] || continue
+        built[$(pacman -Qqp "$f")]=$f
+    done
+    for dep in "${missing[@]}"; do
+        name=${dep%%[<>=]*}
+        if [[ -n "${own[$name]:-}" ]]; then
+            continue
+        elif [[ -n "${built[$name]:-}" ]]; then
+            local_files+=("${built[$name]}")
+        else
+            sync+=("$name")
+        fi
+    done
+    (( ${#sync[@]} == 0 )) || retry pacman -S --noconfirm --needed --asdeps "${sync[@]}"
+    (( ${#local_files[@]} == 0 )) || pacman -U --noconfirm --needed --asdeps "${local_files[@]}"
+}
+
 build_aur_packages() {
     local pkg key built=0
     id builder &>/dev/null || useradd -m builder
@@ -142,6 +204,7 @@ build_aur_packages() {
                 || KEY=$key retry fetch_key sudo -u builder gpg --batch || die "No signing key $key for $pkg"
         done
         retry sudo -u builder env -C "/home/builder/$pkg" makepkg --verifysource --noconfirm
+        install_aur_deps "/home/builder/$pkg"
         sudo -u builder env -C "/home/builder/$pkg" PKGDEST="$LOCALREPO" makepkg -s --noconfirm --needed
         built=$(( built + 1 ))
     done
@@ -179,7 +242,10 @@ write_package_list() {
 # -- The profile --------------------------------------------------------------
 stage_profile() {
     cp -a "$REPO/profile" "$STAGE"
-    cp "$AIROOT/usr/local/share/niix/pacman.conf" "$STAGE/pacman.conf"
+    # The image's pacman.conf, with fewer parallel downloads: mkarchiso
+    # fetches ~1500 packages at once, and 15 in parallel saturate an ordinary
+    # connection until mirrors drop out with "Operation too slow".
+    sed 's/^ParallelDownloads.*/ParallelDownloads = 5/' "$AIROOT/usr/local/share/niix/pacman.conf" > "$STAGE/pacman.conf"
     if [[ -f "$LOCALREPO/niix-local.db.tar.gz" ]]; then
         printf '\n[niix-local]\nSigLevel = Optional TrustAll\nServer = file://%s\n' "$LOCALREPO" >> "$STAGE/pacman.conf"
     fi
@@ -309,6 +375,19 @@ write_permissions() {
 }
 
 # -- The image ----------------------------------------------------------------
+# Every package of the ISO into the cache first, with the ISO's own
+# pacman.conf, in a pass that can be retried: what finished stays, the next
+# attempt fetches only the rest. mkarchiso then installs from the cache and
+# barely touches the network.
+download_packages() {
+    local -a pkgs
+    mapfile -t pkgs < "$STAGE/packages.x86_64"
+    mkdir -p "$WORK/pkgdb"
+    say "${#pkgs[@]} packages plus their dependencies - an interrupted download resumes on the next attempt"
+    retry pacman --config "$STAGE/pacman.conf" --dbpath "$WORK/pkgdb" --cachedir /var/cache/pacman/pkg \
+        -Syw --noconfirm "${pkgs[@]}" || die "Could not download all packages after 5 attempts - check the internet connection, then run the build again (finished downloads are kept in cache/)."
+}
+
 build_iso() {
     say "This is the long part - mkarchiso installs ~1500 packages, then compresses the image."
     # A cached package from another repo with the same file name fails its
@@ -346,5 +425,6 @@ step "GNOME Shell extensions"           add_extensions
 step "Live session settings"            write_live_dconf
 step "GE-Proton"                        add_ge_proton
 step "File permissions"                 write_permissions
+step "Downloading the ISO's packages"   download_packages
 step "Building the ISO image"           build_iso
 step "Done"                             true

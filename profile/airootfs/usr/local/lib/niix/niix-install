@@ -1044,6 +1044,14 @@ configure_system() {
 
     setup_hotspot
 
+    # Snapshots on the installed system only (snap-pac and the cleanup timer
+    # only see configs listed here).
+    if grep -q '^SNAPPER_CONFIGS=' /mnt/etc/conf.d/snapper 2>/dev/null; then
+        sed -i 's/^SNAPPER_CONFIGS=.*/SNAPPER_CONFIGS="root"/' /mnt/etc/conf.d/snapper
+    else
+        mkdir -p /mnt/etc/conf.d && echo 'SNAPPER_CONFIGS="root"' >> /mnt/etc/conf.d/snapper
+    fi
+
     rm -f /mnt/etc/resolv.conf
     ln -s /run/systemd/resolve/stub-resolv.conf /mnt/etc/resolv.conf
     log "Configured: $HOSTNAME, user $USERNAME, $KEYBOARD_NAME, $TIMEZONE"
@@ -1152,7 +1160,7 @@ install_limine() {
     esac
     $USE_MITIGATIONS || cmdline+=" mitigations=off"
     # quiet boot, no lockup watchdog, no zswap on top of ZRAM, 1000 Hz mouse polling
-    cmdline+=" usbhid.mousepoll=1 quiet loglevel=3 nowatchdog zswap.enabled=0"
+    cmdline+=" usbhid.mousepoll=1 quiet loglevel=3 nowatchdog zswap.enabled=0 transparent_hugepage=madvise"
     # Overclocking/undervolting (CoreCtrl) on AMD cards: the default mask plus
     # the overdrive bit (0xffffffff would also enable a feature that hangs GPUs).
     [[ "$GPU_VENDOR" == amd && "$GPU_KIND" == discrete ]] && cmdline+=" amdgpu.ppfeaturemask=0xfff7ffff"
