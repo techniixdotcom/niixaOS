@@ -1,7 +1,0 @@
-# Not part of the ISO: installed from Flathub during the install (they are
-# signed, CDN-backed and update on their own). The build copies this list
-# into the image; the installer reads it from there.
-com.heroicgameslauncher.hgl
-net.davidotek.pupgui2
-com.stremio.Stremio
-com.ktechpit.whatsie

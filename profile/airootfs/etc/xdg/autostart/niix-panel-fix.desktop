@@ -1,6 +1,0 @@
-[Desktop Entry]
-Type=Application
-Name=NiiX Panel: hide Show Apps button
-Exec=/usr/local/bin/niix-panel-fix --watch
-X-GNOME-Autostart-enabled=true
-NoDisplay=true
