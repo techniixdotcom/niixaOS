@@ -15,7 +15,12 @@
   <a href="https://github.com/techniixdotcom/niixarch-install/issues">Report a bug</a>
 </p>
 
----
+
+<p align="center">
+  <img src="niixarch-logo.png" alt="niixaOS" width="500">
+</p>
+
+
 
 Arch is powerful but slow to set up. niixaOS does the setup for you. Boot the USB stick, click **Install NiiX**, answer a few questions, and you get a clean GNOME desktop with your drivers and games ready to go.
 
