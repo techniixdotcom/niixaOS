@@ -1,9 +1,0 @@
-[Unit]
-Description=Generate NiiX flat icons for installed apps
-
-[Service]
-Type=oneshot
-ExecStart=/usr/local/bin/niix-iconify --quiet
-
-[Install]
-WantedBy=multi-user.target

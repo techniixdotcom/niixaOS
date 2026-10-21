@@ -1,7 +1,0 @@
-#!/bin/bash
-# Un-hide apps previously hidden with niix-hide-app
-set -uo pipefail
-A="$HOME/.local/share/applications"
-[ $# -ge 1 ] || { echo "usage: niix-unhide-app <desktop-id> [more...]"; exit 1; }
-for id in "$@"; do id="${id%.desktop}"; rm -f "$A/$id.desktop" && echo "shown: $id"; done
-update-desktop-database "$A" 2>/dev/null || true

@@ -1,4 +1,0 @@
-# Scripts and configs must keep Unix line endings, also on Windows checkouts.
-* text=auto eol=lf
-*.png binary
-*.svg text eol=lf

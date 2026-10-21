@@ -1,6 +1,0 @@
-#!/bin/sh
-# Pre-loads Steam minimized after login, once it is set up and signed in.
-sleep 10
-[ -s "$HOME/.local/share/Steam/config/loginusers.vdf" ] || exit 0
-pgrep -u "$(id -u)" -x steam >/dev/null && exit 0
-exec /usr/local/bin/steam -silent >/dev/null 2>&1

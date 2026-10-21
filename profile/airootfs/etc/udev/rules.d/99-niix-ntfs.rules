@@ -1,4 +1,0 @@
-# Mount internal NTFS volumes as soon as they appear, so a drive attached
-# after boot is usable without a reboot. niix-ntfs itself skips removable
-# media (GNOME/udisks2 handles those) and anything already mounted.
-ACTION=="add", SUBSYSTEM=="block", ENV{DEVTYPE}=="partition", ENV{ID_FS_TYPE}=="ntfs", TAG+="systemd", ENV{SYSTEMD_WANTS}+="niix-ntfs-mount.service"

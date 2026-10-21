@@ -1,4 +1,0 @@
-# mkinitcpio preset file for the 'linux-cachyos' package (NiiX)
-ALL_kver="/boot/vmlinuz-linux-cachyos"
-PRESETS=('default')
-default_image="/boot/initramfs-linux-cachyos.img"

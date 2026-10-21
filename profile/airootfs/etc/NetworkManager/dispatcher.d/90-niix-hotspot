@@ -1,9 +1,0 @@
-#!/bin/sh
-# Wake the hotspot keeper immediately on network changes instead of waiting
-# for its next scheduled check. No-op when auto mode is off.
-case "$2" in
-    up|down|connectivity-change)
-        systemctl kill --kill-whom=main --signal=USR1 niix-hotspot-watchdog.service >/dev/null 2>&1 || true
-        ;;
-esac
-exit 0
