@@ -17,7 +17,7 @@
 
 
 <p align="center">
-  <img src="niixarch-logo.png" alt="niixaOS" width="500">
+  <img src="dt.png" alt="niixaOS">
 </p>
 
 
