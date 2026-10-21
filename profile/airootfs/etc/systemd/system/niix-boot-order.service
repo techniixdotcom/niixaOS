@@ -1,0 +1,10 @@
+[Unit]
+Description=NiiX: keep the NiiX boot menu first after Windows updates
+ConditionPathIsDirectory=/sys/firmware/efi/efivars
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/lib/niix-system/boot-order
+
+[Install]
+WantedBy=multi-user.target

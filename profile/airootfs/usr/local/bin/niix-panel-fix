@@ -1,0 +1,169 @@
+#!/usr/bin/env python3
+"""niix-panel-fix - keep the NiiX panel and menu settings at every login.
+
+dash-to-panel and ArcMenu reset some of their settings on first load, and
+dash-to-panel keeps its layout per monitor. This puts the NiiX values from
+the system dconf defaults back for every monitor, writing only what differs.
+
+  niix-panel-fix           apply once
+  niix-panel-fix --watch   apply 15 times, 3 s apart (the login autostart)
+"""
+import ast
+import configparser
+import json
+import os
+import subprocess
+import sys
+import time
+
+DEFAULTS = "/etc/dconf/db/local.d/00-niix-desktop"
+DTP = "org/gnome/shell/extensions/dash-to-panel"
+ARCMENU = "org/gnome/shell/extensions/arcmenu"
+LOGO = "/usr/share/pixmaps/niixarch-logo.png"
+
+# Per-monitor dash-to-panel settings, stored as JSON keyed by monitor.
+PER_MONITOR = ("panel-sizes", "panel-positions", "panel-lengths", "panel-anchors")
+DTP_KEYS = (
+    "multi-monitors", "focus-highlight", "focus-highlight-color", "focus-highlight-opacity",
+    "dot-color-override", "dot-color-1", "dot-color-2", "dot-color-3", "dot-color-4",
+    "highlight-appicon-hover", "highlight-appicon-hover-background-color",
+    "highlight-appicon-pressed-background-color",
+)
+ARCMENU_KEYS = (
+    "menu-button-appearance", "menu-button-text", "menu-button-icon", "menu-button-icon-size",
+    "position-in-panel", "menu-layout", "override-menu-theme", "menu-background-color",
+    "menu-foreground-color", "menu-border-color", "menu-border-width", "menu-border-radius",
+    "menu-separator-color", "menu-item-hover-bg-color", "menu-item-hover-fg-color",
+    "menu-item-active-bg-color", "menu-item-active-fg-color",
+)
+
+
+def gvariant_string(text):
+    return "'" + text.replace("\\", "\\\\").replace("'", "\\'") + "'"
+
+
+def load_defaults():
+    parser = configparser.RawConfigParser(strict=False, interpolation=None)
+    parser.optionxform = str
+    parser.read(DEFAULTS)
+    return parser
+
+
+def dconf_read(path):
+    try:
+        return subprocess.run(["dconf", "read", "/" + path], capture_output=True,
+                              text=True, timeout=10).stdout.strip()
+    except (OSError, subprocess.SubprocessError):
+        return None
+
+
+def dconf_write(path, value):
+    subprocess.run(["dconf", "write", "/" + path, value], timeout=10,
+                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+
+def json_setting(text):
+    """A dconf string holding JSON, as a dict ({} when unset or unreadable)."""
+    try:
+        data = json.loads(ast.literal_eval(text)) if text else {}
+    except (ValueError, SyntaxError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def monitor_ids():
+    """Monitor IDs as dash-to-panel derives them: vendor-serial, the connector
+    when two clash, else the index."""
+    try:
+        from gi.repository import Gio
+        bus = Gio.bus_get_sync(Gio.BusType.SESSION, None)
+        reply = bus.call_sync("org.gnome.Mutter.DisplayConfig", "/org/gnome/Mutter/DisplayConfig",
+                              "org.gnome.Mutter.DisplayConfig", "GetCurrentState", None, None,
+                              Gio.DBusCallFlags.NONE, 5000, None)
+        logical = reply.unpack()[2]
+    except Exception:
+        return []
+    ids, seen = [], set()
+    for i, monitor in enumerate(logical):
+        try:
+            connector, vendor, _product, serial = monitor[5][0]
+        except (IndexError, ValueError):
+            connector = vendor = serial = ""
+        mid = f"{vendor}-{serial}" if vendor and serial else str(i)
+        if mid in seen:
+            mid = connector if connector and connector not in seen else str(i)
+        seen.add(mid)
+        ids.append(mid)
+    return ids
+
+
+def fixed_elements(current, layout):
+    """The monitor's element list with NiiX's visibility enforced."""
+    visible = {e["element"]: e["visible"] for e in layout}
+    if not isinstance(current, list) or not all(isinstance(e, dict) for e in current):
+        return [dict(e) for e in layout]
+    elements = [dict(e) for e in current]
+    if not any(e.get("element") == layout[0]["element"] for e in elements):
+        elements.insert(0, dict(layout[0]))
+    for element in elements:
+        if element.get("element") in visible:
+            element["visible"] = visible[element["element"]]
+    return elements
+
+
+def apply_layout(defaults):
+    layout = json_setting(defaults.get(DTP, "panel-element-positions"))["0"]
+    path = f"{DTP}/panel-element-positions"
+    text = dconf_read(path)
+    if text is None:
+        return
+    positions = json_setting(text)
+    monitors = list(positions)
+    for mid in monitor_ids() or (["0"] if not monitors else []):
+        if mid not in monitors:
+            monitors.append(mid)
+    wanted = {mid: fixed_elements(positions.get(mid), layout) for mid in monitors}
+    if wanted != positions:
+        dconf_write(path, gvariant_string(json.dumps(wanted, separators=(",", ":"))))
+    for key in PER_MONITOR:
+        path = f"{DTP}/{key}"
+        text = dconf_read(path)
+        if text is None:
+            continue
+        current = json_setting(text)
+        new = dict(current)
+        for mid in monitors:
+            new.setdefault(mid, json_setting(defaults.get(DTP, key))["0"])
+        if new != current:
+            dconf_write(path, gvariant_string(json.dumps(new, separators=(",", ":"))))
+
+
+def enforce(defaults, section, keys, overrides=None):
+    for key in keys:
+        value = (overrides or {}).get(key) or defaults.get(section, key)
+        current = dconf_read(f"{section}/{key}")
+        if current is not None and current != value:
+            dconf_write(f"{section}/{key}", value)
+
+
+def apply(defaults):
+    apply_layout(defaults)
+    enforce(defaults, DTP, DTP_KEYS)
+    # The GNOME logo stands in when the NiiX logo is missing.
+    icon = None if os.path.isfile(LOGO) else gvariant_string("start-here-symbolic")
+    enforce(defaults, ARCMENU, ARCMENU_KEYS, {"menu-button-icon": icon})
+
+
+def main():
+    defaults = load_defaults()
+    if not defaults.has_section(DTP) or not defaults.has_section(ARCMENU):
+        sys.exit(f"niix-panel-fix: {DEFAULTS} is missing the panel settings")
+    rounds = 15 if "--watch" in sys.argv[1:] else 1
+    for i in range(rounds):
+        if i:
+            time.sleep(3)
+        apply(defaults)
+
+
+if __name__ == "__main__":
+    main()

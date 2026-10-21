@@ -1,0 +1,565 @@
+#!/usr/bin/env python3
+"""niix-iconify - NiiX icons for installed apps.
+
+Every NiiX icon is the same dark rounded tile with one Tabler Icons (MIT)
+line drawing in teal or pink. This draws one for every app icon the theme
+doesn't have yet, picking the drawing from the app's name and categories.
+Icons shipped with the theme are never touched.
+
+  niix-iconify                      add the missing icons
+  niix-iconify --quiet              without per-icon output
+  niix-iconify --force              also redraw icons made here before
+  niix-iconify --prune              remove made icons no app uses any more
+  niix-iconify --add NAME GLYPH [pink]   add one icon by hand
+  niix-iconify --list-glyphs        the available drawings
+
+The ISO build also draws the theme's own icons with tile().
+"""
+import glob
+import os
+import re
+import subprocess
+import sys
+
+THEME = "/usr/share/icons/NiiX"
+APPS_DIR = THEME + "/scalable/apps"
+AUTO_MARK = "<!--niix-auto-->"
+TEAL = "#5eead4"
+PINK = "#f0a6c0"
+NAME_RE = re.compile(r"^[A-Za-z0-9._+-]+$")
+
+DESKTOP_DIRS = [
+    "/usr/share/applications",
+    "/usr/local/share/applications",
+    "/var/lib/flatpak/exports/share/applications",
+    *glob.glob("/home/*/.local/share/applications"),
+    *glob.glob("/home/*/.local/share/flatpak/exports/share/applications"),
+]
+
+# Tabler Icons line drawings, one SVG path per entry.
+GLYPHS = {
+    "activity": [
+        '<path d="M3 12h4l3 8l4 -16l3 8h4" />',
+    ],
+    "app-window": [
+        '<path d="M3 7a2 2 0 0 1 2 -2h14a2 2 0 0 1 2 2v10a2 2 0 0 1 -2 2h-14a2 2 0 0 1 -2 -2v-10" />',
+        '<path d="M6 8h.01" />',
+        '<path d="M9 8h.01" />',
+    ],
+    "apps": [
+        '<path d="M4 5a1 1 0 0 1 1 -1h4a1 1 0 0 1 1 1v4a1 1 0 0 1 -1 1h-4a1 1 0 0 1 -1 -1l0 -4" />',
+        '<path d="M4 15a1 1 0 0 1 1 -1h4a1 1 0 0 1 1 1v4a1 1 0 0 1 -1 1h-4a1 1 0 0 1 -1 -1l0 -4" />',
+        '<path d="M14 15a1 1 0 0 1 1 -1h4a1 1 0 0 1 1 1v4a1 1 0 0 1 -1 1h-4a1 1 0 0 1 -1 -1l0 -4" />',
+        '<path d="M14 7l6 0" />',
+        '<path d="M17 4l0 6" />',
+    ],
+    "battery": [
+        '<path d="M6 7h11a2 2 0 0 1 2 2v.5a.5 .5 0 0 0 .5 .5a.5 .5 0 0 1 .5 .5v3a.5 .5 0 0 1 -.5 .5a.5 .5 0 0 0 -.5 .5v.5a2 2 0 0 1 -2 2h-11a2 2 0 0 1 -2 -2v-6a2 2 0 0 1 2 -2" />',
+    ],
+    "book": [
+        '<path d="M3 19a9 9 0 0 1 9 0a9 9 0 0 1 9 0" />',
+        '<path d="M3 6a9 9 0 0 1 9 0a9 9 0 0 1 9 0" />',
+        '<path d="M3 6l0 13" />',
+        '<path d="M12 6l0 13" />',
+        '<path d="M21 6l0 13" />',
+    ],
+    "box": [
+        '<path d="M12 3l8 4.5l0 9l-8 4.5l-8 -4.5l0 -9l8 -4.5" />',
+        '<path d="M12 12l8 -4.5" />',
+        '<path d="M12 12l0 9" />',
+        '<path d="M12 12l-8 -4.5" />',
+    ],
+    "brush": [
+        '<path d="M3 21v-4a4 4 0 1 1 4 4h-4" />',
+        '<path d="M21 3a16 16 0 0 0 -12.8 10.2" />',
+        '<path d="M21 3a16 16 0 0 1 -10.2 12.8" />',
+        '<path d="M10.6 9a9 9 0 0 1 4.4 4.4" />',
+    ],
+    "bug": [
+        '<path d="M9 9v-1a3 3 0 0 1 6 0v1" />',
+        '<path d="M8 9h8a6 6 0 0 1 1 3v3a5 5 0 0 1 -10 0v-3a6 6 0 0 1 1 -3" />',
+        '<path d="M3 13l4 0" />',
+        '<path d="M17 13l4 0" />',
+        '<path d="M12 20l0 -6" />',
+        '<path d="M4 19l3.35 -2" />',
+        '<path d="M20 19l-3.35 -2" />',
+        '<path d="M4 7l3.75 2.4" />',
+        '<path d="M20 7l-3.75 2.4" />',
+    ],
+    "calculator": [
+        '<path d="M4 5a2 2 0 0 1 2 -2h12a2 2 0 0 1 2 2v14a2 2 0 0 1 -2 2h-12a2 2 0 0 1 -2 -2l0 -14" />',
+        '<path d="M8 8a1 1 0 0 1 1 -1h6a1 1 0 0 1 1 1v1a1 1 0 0 1 -1 1h-6a1 1 0 0 1 -1 -1l0 -1" />',
+        '<path d="M8 14l0 .01" />',
+        '<path d="M12 14l0 .01" />',
+        '<path d="M16 14l0 .01" />',
+        '<path d="M8 17l0 .01" />',
+        '<path d="M12 17l0 .01" />',
+        '<path d="M16 17l0 .01" />',
+    ],
+    "calendar": [
+        '<path d="M4 7a2 2 0 0 1 2 -2h12a2 2 0 0 1 2 2v12a2 2 0 0 1 -2 2h-12a2 2 0 0 1 -2 -2v-12" />',
+        '<path d="M16 3v4" />',
+        '<path d="M8 3v4" />',
+        '<path d="M4 11h16" />',
+        '<path d="M11 15h1" />',
+        '<path d="M12 15v3" />',
+    ],
+    "camera": [
+        '<path d="M5 7h1a2 2 0 0 0 2 -2a1 1 0 0 1 1 -1h6a1 1 0 0 1 1 1a2 2 0 0 0 2 2h1a2 2 0 0 1 2 2v9a2 2 0 0 1 -2 2h-14a2 2 0 0 1 -2 -2v-9a2 2 0 0 1 2 -2" />',
+        '<path d="M9 13a3 3 0 1 0 6 0a3 3 0 0 0 -6 0" />',
+    ],
+    "characters": [
+        '<path d="M14 15.5a3.5 3.5 0 1 0 7 0a3.5 3.5 0 1 0 -7 0" />',
+        '<path d="M3 19v-10.5a3.5 3.5 0 0 1 7 0v10.5" />',
+        '<path d="M3 13h7" />',
+        '<path d="M21 12v7" />',
+    ],
+    "clock": [
+        '<path d="M3 12a9 9 0 1 0 18 0a9 9 0 0 0 -18 0" />',
+        '<path d="M12 7v5l3 3" />',
+    ],
+    "cloud": [
+        '<path d="M6.657 18c-2.572 0 -4.657 -2.007 -4.657 -4.483c0 -2.475 2.085 -4.482 4.657 -4.482c.393 -1.762 1.794 -3.2 3.675 -3.773c1.88 -.572 3.956 -.193 5.444 1c1.488 1.19 2.162 3.007 1.77 4.769h.99c1.913 0 3.464 1.56 3.464 3.486c0 1.927 -1.551 3.487 -3.465 3.487h-11.878" />',
+    ],
+    "code": [
+        '<path d="M7 8l-4 4l4 4" />',
+        '<path d="M17 8l4 4l-4 4" />',
+        '<path d="M14 4l-4 16" />',
+    ],
+    "contacts": [
+        '<path d="M5 7a4 4 0 1 0 8 0a4 4 0 1 0 -8 0" />',
+        '<path d="M3 21v-2a4 4 0 0 1 4 -4h4a4 4 0 0 1 4 4v2" />',
+        '<path d="M16 3.13a4 4 0 0 1 0 7.75" />',
+        '<path d="M21 21v-2a4 4 0 0 0 -3 -3.85" />',
+    ],
+    "database": [
+        '<path d="M4 6a8 3 0 1 0 16 0a8 3 0 1 0 -16 0" />',
+        '<path d="M4 6v6a8 3 0 0 0 16 0v-6" />',
+        '<path d="M4 12v6a8 3 0 0 0 16 0v-6" />',
+    ],
+    "desktop": [
+        '<path d="M3 5a1 1 0 0 1 1 -1h16a1 1 0 0 1 1 1v10a1 1 0 0 1 -1 1h-16a1 1 0 0 1 -1 -1v-10" />',
+        '<path d="M7 20h10" />',
+        '<path d="M9 16v4" />',
+        '<path d="M15 16v4" />',
+    ],
+    "device-gamepad-2": [
+        '<path d="M12 5h3.5a5 5 0 0 1 0 10h-5.5l-4.015 4.227a2.3 2.3 0 0 1 -3.923 -2.035l1.634 -8.173a5 5 0 0 1 4.904 -4.019h3.4" />',
+        '<path d="M14 15l4.07 4.284a2.3 2.3 0 0 0 3.925 -2.023l-1.6 -8.232" />',
+        '<path d="M8 9v2" />',
+        '<path d="M7 10h2" />',
+        '<path d="M14 10h2" />',
+    ],
+    "disc": [
+        '<path d="M3 12a9 9 0 1 0 18 0a9 9 0 1 0 -18 0" />',
+        '<path d="M11 12a1 1 0 1 0 2 0a1 1 0 1 0 -2 0" />',
+        '<path d="M7 12a5 5 0 0 1 5 -5" />',
+        '<path d="M12 17a5 5 0 0 0 5 -5" />',
+    ],
+    "disk-usage": [
+        '<path d="M10 3.2a9 9 0 1 0 10.8 10.8a1 1 0 0 0 -1 -1h-6.8a2 2 0 0 1 -2 -2v-7a.9 .9 0 0 0 -1 -.8" />',
+        '<path d="M15 3.5a9 9 0 0 1 5.5 5.5h-4.5a1 1 0 0 1 -1 -1v-4.5" />',
+    ],
+    "download": [
+        '<path d="M4 17v2a2 2 0 0 0 2 2h12a2 2 0 0 0 2 -2v-2" />',
+        '<path d="M7 11l5 5l5 -5" />',
+        '<path d="M12 4l0 12" />',
+    ],
+    "extensions-dev": [
+        '<path d="M4 7h3a1 1 0 0 0 1 -1v-1a2 2 0 0 1 4 0v1a1 1 0 0 0 1 1h3a1 1 0 0 1 1 1v3a1 1 0 0 0 1 1h1a2 2 0 0 1 0 4h-1a1 1 0 0 0 -1 1v3a1 1 0 0 1 -1 1h-3a1 1 0 0 1 -1 -1v-1a2 2 0 0 0 -4 0v1a1 1 0 0 1 -1 1h-3a1 1 0 0 1 -1 -1v-3a1 1 0 0 1 1 -1h1a2 2 0 0 0 0 -4h-1a1 1 0 0 1 -1 -1v-3a1 1 0 0 1 1 -1" />',
+    ],
+    "file-text": [
+        '<path d="M14 3v4a1 1 0 0 0 1 1h4" />',
+        '<path d="M17 21h-10a2 2 0 0 1 -2 -2v-14a2 2 0 0 1 2 -2h7l5 5v11a2 2 0 0 1 -2 2" />',
+        '<path d="M9 9l1 0" />',
+        '<path d="M9 13l6 0" />',
+        '<path d="M9 17l6 0" />',
+    ],
+    "file-zip": [
+        '<path d="M6 20.735a2 2 0 0 1 -1 -1.735v-14a2 2 0 0 1 2 -2h7l5 5v11a2 2 0 0 1 -2 2h-1" />',
+        '<path d="M11 17a2 2 0 0 1 2 2v2a1 1 0 0 1 -1 1h-2a1 1 0 0 1 -1 -1v-2a2 2 0 0 1 2 -2" />',
+        '<path d="M11 5l-1 0" />',
+        '<path d="M13 7l-1 0" />',
+        '<path d="M11 9l-1 0" />',
+        '<path d="M13 11l-1 0" />',
+        '<path d="M11 13l-1 0" />',
+        '<path d="M13 15l-1 0" />',
+    ],
+    "folder": [
+        '<path d="M5 4h4l3 3h7a2 2 0 0 1 2 2v8a2 2 0 0 1 -2 2h-14a2 2 0 0 1 -2 -2v-11a2 2 0 0 1 2 -2" />',
+    ],
+    "fonts": [
+        '<path d="M4 20l3 0" />',
+        '<path d="M14 20l7 0" />',
+        '<path d="M6.9 15l6.9 0" />',
+        '<path d="M10.2 6.3l5.8 13.7" />',
+        '<path d="M5 20l6 -16l2 0l7 16" />',
+    ],
+    "gpu-fan": [
+        '<path d="M3 5a1 1 0 0 1 1 -1h16a1 1 0 0 1 1 1v10a1 1 0 0 1 -1 1h-16a1 1 0 0 1 -1 -1l0 -10" />',
+        '<path d="M7 20h10" />',
+        '<path d="M9 16v4" />',
+        '<path d="M15 16v4" />',
+        '<path d="M9 12v-4" />',
+        '<path d="M12 12v-1" />',
+        '<path d="M15 12v-2" />',
+        '<path d="M12 12v-1" />',
+    ],
+    "gpu-tune": [
+        '<path d="M5 6a1 1 0 0 1 1 -1h12a1 1 0 0 1 1 1v12a1 1 0 0 1 -1 1h-12a1 1 0 0 1 -1 -1l0 -12" />',
+        '<path d="M9 9h6v6h-6l0 -6" />',
+        '<path d="M3 10h2" />',
+        '<path d="M3 14h2" />',
+        '<path d="M10 3v2" />',
+        '<path d="M14 3v2" />',
+        '<path d="M21 10h-2" />',
+        '<path d="M21 14h-2" />',
+        '<path d="M14 21v-2" />',
+        '<path d="M10 21v-2" />',
+    ],
+    "heroic": [
+        '<path d="M9 12l-3 -3h-2a1 1 0 0 0 -1 1v4a1 1 0 0 0 1 1h2l3 -3" />',
+        '<path d="M15 12l3 -3h2a1 1 0 0 1 1 1v4a1 1 0 0 1 -1 1h-2l-3 -3" />',
+        '<path d="M12 15l-3 3v2a1 1 0 0 0 1 1h4a1 1 0 0 0 1 -1v-2l-3 -3" />',
+        '<path d="M12 9l-3 -3v-2a1 1 0 0 1 1 -1h4a1 1 0 0 1 1 1v2l-3 3" />',
+    ],
+    "home": [
+        '<path d="M5 12l-2 0l9 -9l9 9l-2 0" />',
+        '<path d="M5 12v7a2 2 0 0 0 2 2h10a2 2 0 0 0 2 -2v-7" />',
+        '<path d="M9 21v-6a2 2 0 0 1 2 -2h2a2 2 0 0 1 2 2v6" />',
+    ],
+    "key": [
+        '<path d="M16.555 3.843l3.602 3.602a2.877 2.877 0 0 1 0 4.069l-2.643 2.643a2.877 2.877 0 0 1 -4.069 0l-.301 -.301l-6.558 6.558a2 2 0 0 1 -1.239 .578l-.175 .008h-1.172a1 1 0 0 1 -.993 -.883l-.007 -.117v-1.172a2 2 0 0 1 .467 -1.284l.119 -.13l.414 -.414h2v-2h2v-2l2.144 -2.144l-.301 -.301a2.877 2.877 0 0 1 0 -4.069l2.643 -2.643a2.877 2.877 0 0 1 4.069 0" />',
+        '<path d="M15 9h.01" />',
+    ],
+    "logs": [
+        '<path d="M13 5h8" />',
+        '<path d="M13 9h5" />',
+        '<path d="M13 15h8" />',
+        '<path d="M13 19h5" />',
+        '<path d="M3 5a1 1 0 0 1 1 -1h4a1 1 0 0 1 1 1v4a1 1 0 0 1 -1 1h-4a1 1 0 0 1 -1 -1l0 -4" />',
+        '<path d="M3 15a1 1 0 0 1 1 -1h4a1 1 0 0 1 1 1v4a1 1 0 0 1 -1 1h-4a1 1 0 0 1 -1 -1l0 -4" />',
+    ],
+    "lutris": [
+        '<path d="M2 8a2 2 0 0 1 2 -2h16a2 2 0 0 1 2 2v8a2 2 0 0 1 -2 2h-16a2 2 0 0 1 -2 -2l0 -8" />',
+        '<path d="M6 12h4m-2 -2v4" />',
+        '<path d="M15 11l0 .01" />',
+        '<path d="M18 13l0 .01" />',
+    ],
+    "mail": [
+        '<path d="M3 7a2 2 0 0 1 2 -2h14a2 2 0 0 1 2 2v10a2 2 0 0 1 -2 2h-14a2 2 0 0 1 -2 -2v-10" />',
+        '<path d="M3 7l9 6l9 -6" />',
+    ],
+    "map-2": [
+        '<path d="M12 18.5l-3 -1.5l-6 3v-13l6 -3l6 3l6 -3v7.5" />',
+        '<path d="M9 4v13" />',
+        '<path d="M15 7v5.5" />',
+        '<path d="M21.121 20.121a3 3 0 1 0 -4.242 0c.418 .419 1.125 1.045 2.121 1.879c1.051 -.89 1.759 -1.516 2.121 -1.879" />',
+        '<path d="M19 18v.01" />',
+    ],
+    "message-circle": [
+        '<path d="M3 20l1.3 -3.9c-2.324 -3.437 -1.426 -7.872 2.1 -10.374c3.526 -2.501 8.59 -2.296 11.845 .48c3.255 2.777 3.695 7.266 1.029 10.501c-2.666 3.235 -7.615 4.215 -11.574 2.293l-4.7 1" />',
+    ],
+    "movie": [
+        '<path d="M4 6a2 2 0 0 1 2 -2h12a2 2 0 0 1 2 2v12a2 2 0 0 1 -2 2h-12a2 2 0 0 1 -2 -2l0 -12" />',
+        '<path d="M8 4l0 16" />',
+        '<path d="M16 4l0 16" />',
+        '<path d="M4 8l4 0" />',
+        '<path d="M4 16l4 0" />',
+        '<path d="M4 12l16 0" />',
+        '<path d="M16 8l4 0" />',
+        '<path d="M16 16l4 0" />',
+    ],
+    "music": [
+        '<path d="M3 17a3 3 0 1 0 6 0a3 3 0 0 0 -6 0" />',
+        '<path d="M13 17a3 3 0 1 0 6 0a3 3 0 0 0 -6 0" />',
+        '<path d="M9 17v-13h10v13" />',
+        '<path d="M9 8h10" />',
+    ],
+    "nvidia": [
+        '<path d="M13.256 20.473c-.855 .907 -2.583 .643 -2.931 -.79a1.724 1.724 0 0 0 -2.573 -1.066c-1.543 .94 -3.31 -.826 -2.37 -2.37a1.724 1.724 0 0 0 -1.065 -2.572c-1.756 -.426 -1.756 -2.924 0 -3.35a1.724 1.724 0 0 0 1.066 -2.573c-.94 -1.543 .826 -3.31 2.37 -2.37c1 .608 2.296 .07 2.572 -1.065c.426 -1.756 2.924 -1.756 3.35 0a1.724 1.724 0 0 0 2.573 1.066c1.543 -.94 3.31 .826 2.37 2.37a1.724 1.724 0 0 0 1.065 2.572c1.07 .26 1.488 1.29 1.254 2.15" />',
+        '<path d="M19 16l-2 3h4l-2 3" />',
+        '<path d="M9 12a3 3 0 1 0 6 0a3 3 0 0 0 -6 0" />',
+    ],
+    "photo": [
+        '<path d="M15 8h.01" />',
+        '<path d="M3 6a3 3 0 0 1 3 -3h12a3 3 0 0 1 3 3v12a3 3 0 0 1 -3 3h-12a3 3 0 0 1 -3 -3v-12" />',
+        '<path d="M3 16l5 -5c.928 -.893 2.072 -.893 3 0l5 5" />',
+        '<path d="M14 14l1 -1c.928 -.893 2.072 -.893 3 0l3 3" />',
+    ],
+    "presentation": [
+        '<path d="M3 4l18 0" />',
+        '<path d="M4 4v10a2 2 0 0 0 2 2h12a2 2 0 0 0 2 -2v-10" />',
+        '<path d="M12 16l0 4" />',
+        '<path d="M9 20l6 0" />',
+        '<path d="M8 12l3 -3l2 2l3 -3" />',
+    ],
+    "printer": [
+        '<path d="M17 17h2a2 2 0 0 0 2 -2v-4a2 2 0 0 0 -2 -2h-14a2 2 0 0 0 -2 2v4a2 2 0 0 0 2 2h2" />',
+        '<path d="M17 9v-4a2 2 0 0 0 -2 -2h-6a2 2 0 0 0 -2 2v4" />',
+        '<path d="M7 15a2 2 0 0 1 2 -2h6a2 2 0 0 1 2 2v4a2 2 0 0 1 -2 2h-6a2 2 0 0 1 -2 -2l0 -4" />',
+    ],
+    "proton-up": [
+        '<path d="M9 12h-3.586a1 1 0 0 1 -.707 -1.707l6.586 -6.586a1 1 0 0 1 1.414 0l6.586 6.586a1 1 0 0 1 -.707 1.707h-3.586v3h-6v-3" />',
+        '<path d="M9 21h6" />',
+        '<path d="M9 18h6" />',
+    ],
+    "remote-desktop": [
+        '<path d="M7 12l5 5l-1.5 1.5a3.536 3.536 0 1 1 -5 -5l1.5 -1.5" />',
+        '<path d="M17 12l-5 -5l1.5 -1.5a3.536 3.536 0 1 1 5 5l-1.5 1.5" />',
+        '<path d="M3 21l2.5 -2.5" />',
+        '<path d="M18.5 5.5l2.5 -2.5" />',
+        '<path d="M10 11l-2 2" />',
+        '<path d="M13 14l-2 2" />',
+    ],
+    "scanner": [
+        '<path d="M5 12h14" />',
+        '<path d="M3 7v-2a2 2 0 0 1 2 -2h2" />',
+        '<path d="M3 17v2a2 2 0 0 0 2 2h2" />',
+        '<path d="M17 3h2a2 2 0 0 1 2 2v2" />',
+        '<path d="M17 21h2a2 2 0 0 0 2 -2v-2" />',
+    ],
+    "server-2": [
+        '<path d="M3 7a3 3 0 0 1 3 -3h12a3 3 0 0 1 3 3v2a3 3 0 0 1 -3 3h-12a3 3 0 0 1 -3 -3v-2" />',
+        '<path d="M3 15a3 3 0 0 1 3 -3h12a3 3 0 0 1 3 3v2a3 3 0 0 1 -3 3h-12a3 3 0 0 1 -3 -3l0 -2" />',
+        '<path d="M7 8l0 .01" />',
+        '<path d="M7 16l0 .01" />',
+        '<path d="M11 8h6" />',
+        '<path d="M11 16h6" />',
+    ],
+    "settings": [
+        '<path d="M10.325 4.317c.426 -1.756 2.924 -1.756 3.35 0a1.724 1.724 0 0 0 2.573 1.066c1.543 -.94 3.31 .826 2.37 2.37a1.724 1.724 0 0 0 1.065 2.572c1.756 .426 1.756 2.924 0 3.35a1.724 1.724 0 0 0 -1.066 2.573c.94 1.543 -.826 3.31 -2.37 2.37a1.724 1.724 0 0 0 -2.572 1.065c-.426 1.756 -2.924 1.756 -3.35 0a1.724 1.724 0 0 0 -2.573 -1.066c-1.543 .94 -3.31 -.826 -2.37 -2.37a1.724 1.724 0 0 0 -1.065 -2.572c-1.756 -.426 -1.756 -2.924 0 -3.35a1.724 1.724 0 0 0 1.066 -2.573c-.94 -1.543 .826 -3.31 2.37 -2.37c1 .608 2.296 .07 2.572 -1.065" />',
+        '<path d="M9 12a3 3 0 1 0 6 0a3 3 0 0 0 -6 0" />',
+    ],
+    "table": [
+        '<path d="M3 5a2 2 0 0 1 2 -2h14a2 2 0 0 1 2 2v14a2 2 0 0 1 -2 2h-14a2 2 0 0 1 -2 -2v-14" />',
+        '<path d="M3 10h18" />',
+        '<path d="M10 3v18" />',
+    ],
+    "templates": [
+        '<path d="M4 5a1 1 0 0 1 1 -1h14a1 1 0 0 1 1 1v2a1 1 0 0 1 -1 1h-14a1 1 0 0 1 -1 -1l0 -2" />',
+        '<path d="M4 13a1 1 0 0 1 1 -1h4a1 1 0 0 1 1 1v6a1 1 0 0 1 -1 1h-4a1 1 0 0 1 -1 -1l0 -6" />',
+        '<path d="M14 12l6 0" />',
+        '<path d="M14 16l6 0" />',
+        '<path d="M14 20l6 0" />',
+    ],
+    "terminal-2": [
+        '<path d="M8 9l3 3l-3 3" />',
+        '<path d="M13 15l3 0" />',
+        '<path d="M3 6a2 2 0 0 1 2 -2h14a2 2 0 0 1 2 2v12a2 2 0 0 1 -2 2h-14a2 2 0 0 1 -2 -2l0 -12" />',
+    ],
+    "trash-empty": [
+        '<path d="M4 7l16 0" />',
+        '<path d="M10 11l0 6" />',
+        '<path d="M14 11l0 6" />',
+        '<path d="M5 7l1 12a2 2 0 0 0 2 2h8a2 2 0 0 0 2 -2l1 -12" />',
+        '<path d="M9 7v-3a1 1 0 0 1 1 -1h4a1 1 0 0 1 1 1v3" />',
+    ],
+    "tweaks": [
+        '<path d="M4 10a2 2 0 1 0 4 0a2 2 0 0 0 -4 0" />',
+        '<path d="M6 4v4" />',
+        '<path d="M6 12v8" />',
+        '<path d="M10 16a2 2 0 1 0 4 0a2 2 0 0 0 -4 0" />',
+        '<path d="M12 4v10" />',
+        '<path d="M12 18v2" />',
+        '<path d="M16 7a2 2 0 1 0 4 0a2 2 0 0 0 -4 0" />',
+        '<path d="M18 4v1" />',
+        '<path d="M18 9v11" />',
+    ],
+    "usage": [
+        '<path d="M4 19l16 0" />',
+        '<path d="M4 15l4 -6l4 2l4 -5l4 4" />',
+    ],
+    "wifi": [
+        '<path d="M12 18l.01 0" />',
+        '<path d="M9.172 15.172a4 4 0 0 1 5.656 0" />',
+        '<path d="M6.343 12.343a8 8 0 0 1 11.314 0" />',
+        '<path d="M3.515 9.515c4.686 -4.687 12.284 -4.687 17 0" />',
+    ],
+    "world": [
+        '<path d="M3 12a9 9 0 1 0 18 0a9 9 0 0 0 -18 0" />',
+        '<path d="M3.6 9h16.8" />',
+        '<path d="M3.6 15h16.8" />',
+        '<path d="M11.5 3a17 17 0 0 0 0 18" />',
+        '<path d="M12.5 3a17 17 0 0 1 0 18" />',
+    ],
+}
+
+# (pattern, glyph, pink) tried against the icon name and Name, then Categories.
+RULES = [
+    (r"steam|lutris|heroic|emulat|retroarch|minecraft|gamepad|playstation|xbox|proton|\bgame", "device-gamepad-2", True),
+    (r"discord|telegram|signal|slack|matrix|element|whatsapp|messeng|\bchat\b|\birc\b|rocketchat", "message-circle", True),
+    (r"chromium|firefox|chrome|brave|helium|vivaldi|opera|epiphany|browser|\bweb\b", "world", True),
+    (r"spotify|rhythmbox|clementine|lollypop|deezer|tidal|headphone|\bmusic\b|\baudio\b", "music", True),
+    (r"\bmpv\b|\bvlc\b|kodi|stremio|plex|jellyfin|netflix|youtube|totem|movie|video|\bplayer\b", "movie", True),
+    (r"gimp|krita|inkscape|blender|aseprite|\bpaint\b|\bdraw\b|pixel", "brush", True),
+    (r"shotwell|gthumb|\bphoto\b|\bimage\b|picture|\bviewer\b|loupe|\beog\b", "photo", True),
+    (r"\bobs\b|record|stream|webcam|camera|cheese|kamoso", "camera", True),
+    (r"torrent|transmission|qbittorrent|deluge|fragments|\bdownload\b", "download", True),
+    (r"terminal|console|\bkgx\b|tilix|alacritty|kitty|wezterm|ptyxis|\bshell\b|\btty\b", "terminal-2", False),
+    (r"vscode|vscodium|\bvim\b|neovim|emacs|sublime|jetbrains|pycharm|\bidea\b|builder|\bide\b|\bcode\b|\bdevel\b", "code", False),
+    (r"gedit|writer|\bnotes\b|typora|obsidian|markdown|text|document", "file-text", False),
+    (r"calculator|\bcalc\b", "calculator", False),
+    (r"gnumeric|spreadsheet|\bsheet\b|excel|\btable\b", "table", False),
+    (r"impress|presentation|\bslides\b|powerpoint", "presentation", False),
+    (r"evince|papers|okular|xreader|\breader\b|calibre|foliate|\bpdf\b|\bbook\b|ebook", "book", False),
+    (r"thunderbird|geary|evolution|kmail|\bmail\b|email", "mail", False),
+    (r"nautilus|nemo|thunar|dolphin|pcmanfm|\bfiles?\b|explorer|\bmanager\b", "folder", False),
+    (r"system-monitor|\bhtop\b|\bbtop\b|mission-center|\busage\b|resources|\bstats\b|\btask\b", "activity", False),
+    (r"gparted|gnome-disks|baobab|filelight|\bdisk\b|\bdrive\b|partition", "server-2", False),
+    (r"gnome-maps|navigation|\bgps\b|\bmaps?\b", "map-2", False),
+    (r"keyring|seahorse|bitwarden|keepass|\bpassword\b|\bsecret\b|\bvault\b|authent", "key", False),
+    (r"file-roller|xarchiver|\bark\b|archive|\bzip\b|compress", "file-zip", False),
+    (r"wireguard|openvpn|\bvpn\b|\bwifi\b|network|\bnm-", "wifi", False),
+    (r"calendar|\bdate\b", "calendar", False),
+    (r"\bclock\b|\balarm\b|stopwatch|\btime\b", "clock", False),
+    (r"weather", "cloud", False),
+    (r"software|appstore|discover|pamac|octopi|warehouse|\bstore\b|market", "apps", False),
+    (r"\bcups\b|printer|\bprint\b|\bscan\b", "printer", False),
+    (r"virtualbox|vmware|\bqemu\b|\bboxes\b|\bvirt", "box", False),
+    (r"dbeaver|postgres|mysql|\bsql\b|database", "database", False),
+    (r"\bbug\b|debug", "bug", False),
+    (r"settings|preferences|control-center|\btweak\b|\bdconf\b|\bconfig\b", "settings", False),
+]
+
+
+def tile(glyph, colour, auto=True):
+    """The SVG icon. auto marks it as made here, so --force and --prune may touch it."""
+    return (
+        '<svg xmlns="http://www.w3.org/2000/svg" width="256" height="256" viewBox="0 0 256 256">'
+        + (AUTO_MARK if auto else "") + "\n"
+        '  <rect x="14" y="14" width="228" height="228" rx="58" fill="#121821" stroke="#1f2a33" stroke-width="2"/>\n'
+        f'  <g transform="translate(64,64) scale(5.3333)" fill="none" stroke="{colour}" stroke-width="1.6" '
+        'stroke-linecap="round" stroke-linejoin="round">\n'
+        + "".join(f"    {path}\n" for path in GLYPHS[glyph])
+        + "  </g>\n</svg>\n"
+    )
+
+
+def pick(name, categories):
+    # The app's own name first, so a generic category such as AudioVideo
+    # doesn't outrank a specific match.
+    for text in (name, categories):
+        for pattern, glyph, pink in RULES:
+            if re.search(pattern, text):
+                return glyph, pink
+    return "app-window", False
+
+
+def read_desktops():
+    """Icon name -> (Name, Categories) of the first app using it."""
+    apps = {}
+    for folder in DESKTOP_DIRS:
+        for path in glob.glob(os.path.join(folder, "*.desktop")):
+            icon = name = categories = ""
+            in_entry = False
+            try:
+                with open(path, encoding="utf-8", errors="ignore") as fh:
+                    for line in fh:
+                        line = line.strip()
+                        if line.startswith("["):
+                            in_entry = line == "[Desktop Entry]"
+                        elif not in_entry:
+                            continue
+                        elif line.startswith("Icon=") and not icon:
+                            icon = line[5:].strip()
+                        elif line.startswith("Name=") and not name:
+                            name = line[5:].strip()
+                        elif line.startswith("Categories=") and not categories:
+                            categories = line[11:].strip()
+            except OSError:
+                continue
+            if icon and icon not in apps:
+                apps[icon] = (name, categories)
+    return apps
+
+
+def is_auto(path):
+    try:
+        with open(path, encoding="utf-8", errors="ignore") as fh:
+            return AUTO_MARK in fh.read(200)
+    except OSError:
+        return False
+
+
+def write(path, text):
+    with open(path, "w", encoding="utf-8") as fh:
+        fh.write(text)
+
+
+def update_cache():
+    try:
+        subprocess.run(["gtk-update-icon-cache", "-f", THEME],
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
+    except OSError:
+        pass
+
+
+def add_one(args, quiet):
+    rest = [a for a in args[args.index("--add") + 1:] if not a.startswith("-")]
+    if len(rest) < 2:
+        sys.exit("usage: niix-iconify --add NAME GLYPH [pink]")
+    name, glyph = rest[0], rest[1]
+    if not NAME_RE.match(name):
+        sys.exit("refused: unsafe icon name")
+    if glyph not in GLYPHS:
+        sys.exit(f"unknown glyph '{glyph}' (see --list-glyphs)")
+    pink = len(rest) > 2 and rest[2].lower() == "pink"
+    write(os.path.join(APPS_DIR, name + ".svg"), tile(glyph, PINK if pink else TEAL))
+    if not quiet:
+        print(f"added {name} -> {glyph}")
+    update_cache()
+
+
+def main():
+    args = sys.argv[1:]
+    quiet = "--quiet" in args
+    if "--help" in args or "-h" in args:
+        print(__doc__)
+        return
+    if "--list-glyphs" in args:
+        print(" ".join(sorted(GLYPHS)))
+        return
+    os.makedirs(APPS_DIR, exist_ok=True)
+    if "--add" in args:
+        add_one(args, quiet)
+        return
+
+    used = set()
+    added = pruned = 0
+    for icon, (name, categories) in read_desktops().items():
+        # Paths and odd names: those apps ship their own icon file.
+        if not NAME_RE.match(icon) or icon.startswith("."):
+            continue
+        used.add(icon)
+        dest = os.path.join(APPS_DIR, icon + ".svg")
+        if os.path.exists(dest) and not ("--force" in args and is_auto(dest)):
+            continue
+        glyph, pink = pick(f"{icon} {name}".lower(), categories.lower())
+        try:
+            write(dest, tile(glyph, PINK if pink else TEAL))
+        except OSError as exc:
+            if not quiet:
+                print(f"  ! {icon}: {exc}")
+            continue
+        added += 1
+        if not quiet:
+            print(f"  + {icon:<40} {glyph}{' (pink)' if pink else ''}")
+
+    if "--prune" in args:
+        for path in glob.glob(os.path.join(APPS_DIR, "*.svg")):
+            icon = os.path.basename(path)[:-4]
+            if icon not in used and is_auto(path):
+                os.remove(path)
+                pruned += 1
+                if not quiet:
+                    print(f"  - {icon} (pruned)")
+
+    if added or pruned:
+        update_cache()
+    if not quiet:
+        print(f"niix-iconify: {added} added, {pruned} pruned ({len(used)} apps scanned)")
+
+
+if __name__ == "__main__":
+    main()

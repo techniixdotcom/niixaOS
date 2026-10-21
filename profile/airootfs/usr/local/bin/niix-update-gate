@@ -1,0 +1,23 @@
+#!/bin/bash
+# niix-update-gate - the automatic update waits (this cycle is skipped, not
+# failed) while a game runs or another package operation is busy.
+#
+# The Steam client itself does not count: NiiX starts it at every login, so
+# it runs nearly all the time and would block every update. A game started
+# from Steam runs under Steam's "reaper" process; Proton, Lutris and Heroic
+# games run a wineserver.
+if [ -e /var/lib/pacman/db.lck ]; then
+    echo "NiiX update gate: another package operation is running - skipping this update cycle"
+    exit 1
+fi
+if pgrep -x reaper >/dev/null 2>&1; then
+    echo "NiiX update gate: a Steam game is running - skipping this update cycle"
+    exit 1
+fi
+for p in wineserver gamescope retroarch; do
+    if pgrep -x "$p" >/dev/null 2>&1; then
+        echo "NiiX update gate: '$p' is running - skipping this update cycle"
+        exit 1
+    fi
+done
+exit 0

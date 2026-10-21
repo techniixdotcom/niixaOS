@@ -1,0 +1,7 @@
+// The administrator at the screen changes Wi-Fi, VPN and hotspot settings
+// without a password prompt each time, as on other desktops.
+polkit.addRule(function(action, subject) {
+    if (action.id.indexOf("org.freedesktop.NetworkManager.") == 0 &&
+        subject.local == true && subject.active == true &&
+        subject.isInGroup("wheel")) { return polkit.Result.YES; }
+});

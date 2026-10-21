@@ -1,0 +1,11 @@
+[Unit]
+Description=NiiX bufferbloat fix: measure this network's speed
+After=NetworkManager.service
+# Started by niix-qos apply on a network it has not measured yet. It waits
+# until the line is idle and no game runs (up to ~30 minutes), then measures
+# for about 30 seconds.
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/niix-qos measure --auto
+TimeoutStartSec=45min

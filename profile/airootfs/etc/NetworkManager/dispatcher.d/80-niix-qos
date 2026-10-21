@@ -1,0 +1,11 @@
+#!/bin/sh
+# Re-check the bufferbloat shaping (niix-qos) whenever the internet
+# connection may have changed: a connection came up or went down, or DHCP
+# handed out a new address or router. niix-qos.service does the work, so a
+# burst of events runs it once and this hook never holds up NetworkManager.
+case "$2" in
+    up|down|dhcp4-change|dhcp6-change|reapply)
+        systemctl --no-block restart niix-qos.service >/dev/null 2>&1 || true
+        ;;
+esac
+exit 0

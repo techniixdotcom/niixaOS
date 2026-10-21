@@ -1,0 +1,1394 @@
+#!/bin/bash
+# niix-install - installs NiiX Arch from the live ISO (runs as root).
+#
+# The graphical installer (niix-installer) asks the questions and runs this
+# with the answers on stdin; it reports back with @@ lines:
+#
+#   niix-install --probe                     what is on this computer
+#   niix-install --check-account HOST USER   are these names usable?
+#   niix-install --answers < answers         install
+#
+# Answers, one KEY=VALUE per line (never written to disk):
+#   MODE           dualboot | singleboot
+#   TARGET_REGION  DRIVE|START_MIB|END_MIB   dual-boot into free space, or
+#   DELETE_PART    /dev/PARTITION            dual-boot into a replaced partition
+#   SINGLE_DRIVE   /dev/DRIVE                single-boot: the whole drive is wiped
+#   KEYBOARD  TIMEZONE  HOSTNAME  USERNAME  USER_PASS  LUKS_PASS
+#   MITIGATIONS    on | off
+#   REPLACE_KERNELS=yes, HOTSPOT_SSID, HOTSPOT_PASS   (optional)
+#
+# The live image is already the finished system. This copies it to an
+# encrypted Btrfs disk and adds what depends on the answers and the hardware:
+# partitions, user, keyboard, time zone, GPU driver and boot menu.
+#
+# LUKS2, Btrfs (@ @home @snapshots @var_log), Limine (UEFI), linux-cachyos, ZRAM.
+set -uo pipefail
+
+# -- Settings
+MAPPER=cryptroot
+BTRFS_OPTS="noatime,compress=zstd,space_cache=v2"
+NIIX_MIN_GIB=40          # smallest space NiiX installs into
+NIIX_SHARE=/usr/local/share/niix
+CACHYOS_KEY_FPR="882DCFE48E2051D48E2562ABF3B607488DB35A47"
+FLATPAK_APPS=()          # packages/flatpak.txt, copied into the image by the build
+[[ -r $NIIX_SHARE/flatpak-apps ]] && mapfile -t FLATPAK_APPS < <(grep -v '^#' "$NIIX_SHARE/flatpak-apps" | awk NF)
+DL_DIR=/mnt/var/tmp/niix-downloads
+# Inherited by pacman in the chroot: no snap-pac snapshots of a half-installed
+# system, and its ps call fails in arch-chroot ("fatal library error, lookup self").
+export SNAP_PAC_SKIP=y
+
+case "${1:-}" in
+    --probe|--check-account) LOGFILE=/dev/null ;;
+    *)  LOGFILE="/root/niixarch-install-$(date +%Y%m%d-%H%M%S).log"
+        exec > >(tee -a "$LOGFILE") 2>&1 ;;
+esac
+
+# -- State
+declare -A ANS=()
+INSTALL_MODE=""; SINGLE_DRIVE=""; TARGET_DRIVE=""; FREE_START=""; FREE_END=""
+EFI_PART=""; EFI_DRIVE=""; EFI_PART_NUM=""; LUKS_PART=""; LUKS_UUID=""
+HOSTNAME=""; USERNAME=""; USER_PASS=""; LUKS_PASS=""; TIMEZONE=""; USE_MITIGATIONS=false
+HOTSPOT_SSID=""; HOTSPOT_PASS=""
+KB_NAME=(); KB_XKB=(); KB_VAR=(); KB_KM=()
+KEYBOARD_NAME=""; KEYMAP=us; KEYMAP_X11=us; KEYMAP_X11_VARIANT=""
+CPU_VENDOR=""; CPU_MODEL=""; GPU_VENDOR=""; GPU_MODEL=""; GPU_KIND=""
+HAS_NVIDIA=0; HAS_AMD=0; HAS_INTEL=0; GPU_COUNT=0
+FORM=""; HANDHELD=""; VIRT=""; CPU_X3D=no; CPU_HYBRID=no; MEM_TOTAL_GB=0
+CLEAN_OK=false; HHD_WANTED=false; DL_PIDS=()
+STEP_NAME=""; STEP_START=0; STEP_TIMES=()
+
+# -- Output
+log()  { printf '  ✔  %s\n' "$*"; }
+info() { printf '  •  %s\n' "$*"; }
+warn() { printf '  !  %s\n' "$*"; }
+dbg()  { echo "[DBG $(date +%H:%M:%S)] $*" >> "$LOGFILE"; }
+
+# Starts a section; the GUI shows its title as the current step.
+hr() {
+    step_done
+    STEP_NAME=$1
+    STEP_START=$SECONDS
+    printf '@@step %s\n\n== %s ==\n' "$1" "$1"
+}
+
+step_done() {
+    local took
+    [[ -n "$STEP_NAME" ]] || return 0
+    took=$(( SECONDS - STEP_START ))
+    STEP_TIMES+=("$(printf '%3dm %02ds  %s' $(( took / 60 )) $(( took % 60 )) "$STEP_NAME")")
+    STEP_NAME=""
+}
+
+err() {
+    printf '@@error %s\nERROR: %s\n' "$*" "$*"
+    dump_state "ERROR: $*" 2>/dev/null || true
+    release_target
+    exit 1
+}
+
+release_target() {
+    stop_downloads
+    gpgconf --homedir /mnt/etc/pacman.d/gnupg --kill all 2>/dev/null || true
+    umount -R /mnt 2>/dev/null || true
+    cryptsetup close "$MAPPER" 2>/dev/null || true
+}
+
+dump_state() {
+    {
+        printf '\n==== %s (%s) ====\n' "$1" "$(date)"
+        lsblk -f; echo; blkid; echo; efibootmgr -v; echo; findmnt -R /mnt
+        printf 'EFI_PART=%s EFI_DRIVE=%s EFI_PART_NUM=%s TARGET_DRIVE=%s LUKS_PART=%s LUKS_UUID=%s FREE=%s-%s\n' \
+            "$EFI_PART" "$EFI_DRIVE" "$EFI_PART_NUM" "$TARGET_DRIVE" "$LUKS_PART" "$LUKS_UUID" "$FREE_START" "$FREE_END"
+    } >> "$LOGFILE" 2>&1
+}
+
+# -- Drives
+# Partition N of a disk (NVMe and MMC put a 'p' before the number).
+part_path() {
+    if [[ "$1" == *nvme* || "$1" == *mmcblk* ]]; then printf '%sp%s' "$1" "$2"; else printf '%s%s' "$1" "$2"; fi
+}
+
+part_number() {
+    local num
+    num=$(lsblk -no PARTN "$1" 2>/dev/null | head -1 | tr -d '[:space:]')
+    [[ -n "$num" ]] || num=$(grep -o '[0-9]*$' <<< "$1")
+    printf '%s' "$num"
+}
+
+big_enough() {
+    local bytes
+    bytes=$(lsblk -bdno SIZE "$1" 2>/dev/null | head -1 | tr -d '[:space:]')
+    (( ${bytes:-0} >= NIIX_MIN_GIB * 1073741824 ))
+}
+
+# USB, removable and virtual devices are never install targets.
+is_removable() {
+    local dev
+    dev=$(basename "$1")
+    case "$dev" in loop*|ram*|dm-*|zram*|nbd*|md*|sr*) return 0 ;; esac
+    [[ "$(cat "/sys/block/$dev/removable" 2>/dev/null)" == 1 ]] && return 0
+    [[ "$(lsblk -dn -o TRAN "/dev/$dev" 2>/dev/null | tr -d '[:space:]')" == usb ]]
+}
+
+internal_disks() {
+    local path type
+    while read -r path type; do
+        [[ "$type" == disk ]] && ! is_removable "$path" && printf '%s\n' "$path"
+    done < <(lsblk -dn -o PATH,TYPE 2>/dev/null)
+}
+
+# Sets EFI_PART, EFI_DRIVE and EFI_PART_NUM to the ESP on an internal drive.
+locate_efi() {
+    local dev parent drive partnum
+    while IFS= read -r dev; do
+        parent=$(lsblk -no PKNAME "$dev" 2>/dev/null)
+        [[ -b "$dev" ]] || continue
+        [[ -n "$parent" ]] && is_removable "/dev/$parent" && continue
+        EFI_PART=$dev
+        break
+    done < <(blkid -t PART_ENTRY_TYPE="c12a7328-f81f-11d2-ba4b-00a0c93ec93b" -o device 2>/dev/null)
+    if [[ -z "$EFI_PART" ]]; then
+        while IFS= read -r drive; do
+            partnum=$(parted -m "$drive" print 2>/dev/null | awk -F: '$7 ~ /esp/ || $7 ~ /boot/ {print $1; exit}')
+            [[ -n "$partnum" ]] && { EFI_PART=$(part_path "$drive" "$partnum"); break; }
+        done < <(internal_disks)
+    fi
+    [[ -n "$EFI_PART" && -b "$EFI_PART" ]] || return 1
+    EFI_DRIVE="/dev/$(lsblk -no PKNAME "$EFI_PART" 2>/dev/null)"
+    EFI_PART_NUM=$(part_number "$EFI_PART")
+}
+
+# Windows on an internal drive: an NTFS partition, or its boot manager.
+windows_present() {
+    local dev parent mnt found=1
+    while IFS= read -r dev; do
+        parent=$(lsblk -no PKNAME "$dev" 2>/dev/null)
+        [[ -n "$parent" ]] && is_removable "/dev/$parent" && continue
+        [[ "$(blkid -s TYPE -o value "$dev" 2>/dev/null)" == ntfs ]] && { log "Windows partition found: $dev"; return 0; }
+    done < <(lsblk -lno PATH,TYPE 2>/dev/null | awk '$2 == "part" { print $1 }')
+    while IFS= read -r dev; do
+        parent=$(lsblk -no PKNAME "$dev" 2>/dev/null)
+        [[ -n "$parent" ]] && is_removable "/dev/$parent" && continue
+        mnt=$(mktemp -d) || return 1
+        if mount -o ro "$dev" "$mnt" 2>/dev/null; then
+            [[ -f "$mnt/EFI/Microsoft/Boot/bootmgfw.efi" ]] && { log "Windows boot manager found: $dev"; found=0; }
+            umount "$mnt"
+        fi
+        rmdir "$mnt"
+        (( found == 0 )) && return 0
+    done < <(blkid -t PART_ENTRY_TYPE="c12a7328-f81f-11d2-ba4b-00a0c93ec93b" -o device 2>/dev/null)
+    return 1
+}
+
+# A BitLocker volume (also Windows' "Device encryption") on an internal drive.
+bitlocker_present() {
+    local dev parent
+    while IFS= read -r dev; do
+        parent=$(lsblk -no PKNAME "$dev" 2>/dev/null)
+        [[ -n "$parent" ]] && is_removable "/dev/$parent" && continue
+        return 0
+    done < <(blkid -t TYPE=BitLocker -o device 2>/dev/null)
+    return 1
+}
+
+# Free space of NIIX_MIN_GIB or more: DRIVE|START_MIB|END_MIB|SIZE_GIB|MODEL
+list_free_regions() {
+    local drive model
+    while IFS= read -r drive; do
+        model=$(lsblk -dn -o MODEL "$drive" 2>/dev/null)
+        timeout 5 parted -m "$drive" unit MiB print free 2>/dev/null \
+            | awk -F: -v drive="$drive" -v model="${model:-Unknown}" -v min=$(( NIIX_MIN_GIB * 1024 )) '
+                $NF ~ /free/ { s = $2; e = $3; sub(/MiB/, "", s); sub(/MiB/, "", e)
+                    if (e - s >= min) printf "%s|%.0f|%.0f|%.1f|%s\n", drive, s, e, (e - s) / 1024, model }'
+    done < <(internal_disks)
+}
+
+# Partition types needed to boot: EFI system, Microsoft reserved, Windows
+# recovery, BIOS boot (GPT), and EFI / hidden recovery (MBR).
+BOOT_PARTTYPES="c12a7328-f81f-11d2-ba4b-00a0c93ec93b e3c9e316-0b5c-4db8-817d-f92df00215ae de94bba4-06d1-4d40-a16a-bfd50179d6ac 21686148-6449-6e6f-744e-656564454649 0xef 0x27"
+
+# The Windows system itself: NTFS with \Windows\System32, or BitLocker. An NTFS
+# volume that can't be looked into (hibernated, damaged) counts as Windows.
+is_windows_system() {
+    local part=$1 fs=$2 mnt rc=0
+    case "${fs,,}" in
+        bitlocker) return 0 ;;
+        ntfs) ;;
+        *) return 1 ;;
+    esac
+    mnt=$(mktemp -d) || return 0
+    if mount -t ntfs3 -o ro "$part" "$mnt" 2>/dev/null || mount -t ntfs-3g -o ro "$part" "$mnt" 2>/dev/null; then
+        [[ -d "$mnt/Windows/System32" ]] || rc=1
+        umount "$mnt"
+    fi
+    rmdir "$mnt"
+    return "$rc"
+}
+
+# Partitions that may be replaced (another Linux, an old NiiX, a data
+# partition): everything of NIIX_MIN_GIB or more except Windows and the boot
+# partitions. PATH|SIZE|FSTYPE|DRIVE|NAME, NAME being a label if it has one.
+list_deletable_partitions() {
+    local disk path type size ptype fs name min=$(( NIIX_MIN_GIB * 1073741824 ))
+    while IFS= read -r disk; do
+        # PARTTYPE last: it is empty on disks without a partition table entry.
+        while read -r path type size ptype; do
+            [[ "$type" == part && "$size" =~ ^[0-9]+$ ]] || continue
+            (( size >= min )) || continue
+            [[ " $BOOT_PARTTYPES " == *" ${ptype,,} "* ]] && continue
+            fs=$(blkid -s TYPE -o value "$path" 2>/dev/null)
+            is_windows_system "$path" "$fs" && continue
+            name=$(blkid -s LABEL -o value "$path" 2>/dev/null)
+            [[ -n "$name" ]] || name=$(lsblk -dno PARTLABEL "$path" 2>/dev/null)
+            printf '%s|%s|%s|%s|%s\n' "$path" "$(awk -v n="$size" 'BEGIN {
+                    if (n >= 2^40) printf "%.1fT", n / 2^40; else printf "%.0fG", n / 2^30 }')" \
+                "${fs:-unknown}" "$disk" "${name//|//}"
+        done < <(lsblk -lnpb -o PATH,TYPE,SIZE,PARTTYPE "$disk" 2>/dev/null)
+    done < <(internal_disks)
+}
+
+esp_kernels() {
+    local f
+    for f in "$1"/vmlinuz-linux* "$1"/initramfs-linux*.img; do [[ -e "$f" ]] && printf '%s\n' "$f"; done
+}
+
+niix_owns_esp() {
+    grep -qs 'NiiX Arch' "$1"/limine.conf "$1"/limine/limine.conf "$1"/EFI/limine/limine.conf "$1"/EFI/BOOT/limine.conf
+}
+
+# Bytes the EFI partition has for NiiX: what is free plus the old kernels
+# the install replaces.
+efi_room() {
+    local mnt room="" f
+    mnt=$(mktemp -d) || return 1
+    if mount -o ro "$EFI_PART" "$mnt" 2>/dev/null; then
+        room=$(( $(stat -f -c '%a * %S' "$mnt") ))
+        while IFS= read -r f; do room=$(( room + $(stat -c %s "$f") )); done < <(esp_kernels "$mnt")
+        umount "$mnt"
+    fi
+    rmdir "$mnt"
+    printf '%s\n' "$room"     # empty when it could not be read
+}
+
+efi_has_foreign_kernels() {
+    local mnt rc=1
+    mnt=$(mktemp -d) || return 1
+    if mount -o ro "$EFI_PART" "$mnt" 2>/dev/null; then
+        [[ -n "$(esp_kernels "$mnt")" ]] && ! niix_owns_esp "$mnt" && rc=0
+        umount "$mnt"
+    fi
+    rmdir "$mnt"
+    return "$rc"
+}
+
+# -- Keyboards
+# NAME|CONSOLE_KEYMAPS|XKB_LAYOUTS|XKB_VARIANTS; console keymaps are tried in order.
+keyboard_table() {
+    cat <<'KBEOF'
+Belgian|be-latin1|be|
+Brazilian (ABNT2)|br-abnt2|br|
+Bulgarian (+ English)|us|us,bg|
+Canadian French|cf|ca|
+Canadian Multilingual|cf|ca|multix
+Croatian|croat|hr|
+Czech|cz-qwertz cz|cz|
+Danish|dk-latin1|dk|
+Dutch|nl|nl|
+English (UK)|uk|gb|
+English (US)|us|us|
+English (US, Colemak)|colemak|us|colemak
+English (US, Dvorak)|dvorak|us|dvorak
+English (US, International)|us-acentos|us|intl
+Estonian|et|ee|
+Finnish|fi|fi|
+French|fr-latin1|fr|
+French (Bepo)|fr-bepo-latin9|fr|bepo
+French (Swiss)|fr_CH-latin1|ch|fr
+German|de-latin1|de|
+German (Austria)|de-latin1|at|
+German (Neo 2)|neo|de|neo
+German (Swiss)|de_CH-latin1|ch|
+Greek (+ English)|us|us,gr|
+Hungarian|hu|hu|
+Icelandic|is-latin1|is|
+Irish|uk|ie|
+Italian|it|it|
+Japanese (106)|jp106|jp|
+Latin American|la-latin1|latam|
+Latvian|lv|lv|
+Lithuanian|lt|lt|
+Norwegian|no-latin1|no|
+Polish|pl2|pl|
+Portuguese|pt-latin1|pt|
+Romanian|ro|ro|
+Russian (+ English)|us|us,ru|
+Serbian (Latin)|sr-latin|rs|latin
+Slovak|sk-qwertz|sk|
+Slovenian|slovene|si|
+Spanish|es|es|
+Swedish|sv-latin1|se|
+Turkish (F)|trf|tr|f
+Turkish (Q)|trq|tr|
+Ukrainian (+ English)|us|us,ua|
+KBEOF
+}
+
+# Fills KB_*. KB_KM is the first console keymap this ISO has, else us.
+load_keyboards() {
+    local name cons xkb var cand available km
+    available=$(localectl list-keymaps --no-pager 2>/dev/null)
+    while IFS='|' read -r name cons xkb var; do
+        km=us
+        for cand in $cons; do
+            if [[ -z "$available" ]] || grep -qxF "$cand" <<< "$available"; then km=$cand; break; fi
+        done
+        KB_NAME+=("$name"); KB_XKB+=("$xkb"); KB_VAR+=("$var"); KB_KM+=("$km")
+    done < <(keyboard_table)
+}
+
+# The desktop layout that types like the console keymap, so the disk
+# password typed in the GUI is the same one typed at boot.
+typing_layout() {
+    local xkb=${KB_XKB[$1]%%,*} var=${KB_VAR[$1]%%,*}
+    if [[ "${KB_KM[$1]}" == us ]]; then printf 'us'; else printf '%s%s' "$xkb" "${var:++$var}"; fi
+}
+
+# -- Checks
+hostname_problem() {
+    [[ "$1" =~ ^[a-zA-Z0-9]([a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?$ ]] && return 0
+    echo "Use only letters, digits and hyphens (not at the start or end), at most 63 characters."
+    return 1
+}
+
+username_problem() {
+    if [[ ! "$1" =~ ^[a-z_][a-z0-9_-]{0,31}$ ]]; then
+        echo "Start with a lowercase letter or underscore; use only lowercase letters, digits, - and _."
+        return 1
+    fi
+    case "$1" in
+        root|bin|daemon|mail|ftp|http|nobody|dbus|polkitd|rtkit|gdm|colord|avahi|geoclue|usbmux|\
+        flatpak|git|dnsmasq|saned|tss|uuidd|alpm|ntp|cups|lp|games|kvm|render|video|audio|input|\
+        wheel|users|storage|optical|adm|log|utmp|tty|disk|floppy|scanner|rfkill|sgx|niix|systemd-*|nm-*)
+            echo "'$1' is reserved by the system - please choose another."; return 1 ;;
+    esac
+    if getent passwd "$1" >/dev/null || getent group "$1" >/dev/null; then
+        echo "'$1' is already a system account - please choose another."; return 1
+    fi
+}
+
+hotspot_problem() (
+    LC_ALL=C
+    local name_re='^[A-Za-z0-9._-]([A-Za-z0-9 ._-]{0,30}[A-Za-z0-9._-])?$' pass_re='^[ -~]{8,63}$'
+    [[ "$1" =~ $name_re ]] || { echo "The name must be 1-32 letters, digits, spaces, dots, dashes or underscores."; return 1; }
+    if [[ ! "$2" =~ $pass_re || "$2" == " "* || "$2" == *" " ]]; then
+        echo "The password must be 8-63 characters, no space at the start or end."; return 1
+    fi
+)
+
+wifi_can_host() {
+    local net
+    for net in /sys/class/net/*/phy80211; do
+        [[ -e "$net" ]] || continue
+        iw phy "$(basename "$(readlink -f "$net")")" info 2>/dev/null | awk '
+            /Supported interface modes:/ { m = 1; next }
+            m && /^\t\t \* / { if ($2 == "AP") f = 1; next }
+            m { m = 0 }
+            END { exit !f }' && return 0
+    done
+    return 1
+}
+
+# 4 for x86-64-v4, 3 for v3, else 1, as glibc sees this CPU.
+cpu_level() {
+    local levels
+    levels=$(/lib64/ld-linux-x86-64.so.2 --help 2>/dev/null)
+    if grep -q 'x86-64-v4 (supported, searched)' <<< "$levels"; then echo 4
+    elif grep -q 'x86-64-v3 (supported, searched)' <<< "$levels"; then echo 3
+    else echo 1; fi
+}
+
+internet_up() {
+    local i
+    for (( i = 1; i <= $1; i++ )); do
+        ping -c1 -W3 archlinux.org &>/dev/null && return 0
+        sleep 2
+    done
+    return 1
+}
+
+check_prereqs() {
+    hr "Pre-flight Checks"
+    [[ $EUID -eq 0 ]]          || err "The installer must run as root."
+    [[ -f /etc/niix-live ]]    || err "Start the installer from the NiiX live ISO."
+    (( $(cpu_level) >= 3 ))    || err "This CPU is too old for NiiX - it needs x86-64-v3 (AVX2): Intel Core 4th generation or AMD Ryzen and newer."
+    [[ -d /sys/firmware/efi ]] || err "Not started in UEFI mode - turn on UEFI (and off legacy/CSM) in the firmware settings."
+    # SecureBoot-<GUID>: 4 attribute bytes, then 1 = on.
+    local sb
+    sb=$(find /sys/firmware/efi/efivars -maxdepth 1 -name 'SecureBoot-*' 2>/dev/null | head -1)
+    if [[ -n "$sb" && "$(od -An -tu1 -j4 -N1 "$sb" 2>/dev/null | tr -d ' ')" == 1 ]]; then
+        err "Secure Boot is on - turn it off in the firmware settings (Limine does not support it), then start the installer again."
+    fi
+    internet_up 3 || err "No internet connection - connect to a network first."
+    local cmd
+    for cmd in cryptsetup parted sgdisk wipefs mkfs.btrfs mkfs.fat efibootmgr unsquashfs rsync arch-chroot genfstab reflector; do
+        command -v "$cmd" &>/dev/null || err "$cmd is missing from the live ISO."
+    done
+    log "All checks passed"
+}
+
+# -- The answers
+read_answers() {
+    local line key
+    while IFS= read -r line; do
+        [[ -n "$line" ]] || continue
+        key=${line%%=*}
+        case "$key" in
+            MODE|TARGET_REGION|DELETE_PART|SINGLE_DRIVE|KEYBOARD|TIMEZONE|HOSTNAME|USERNAME|\
+            USER_PASS|LUKS_PASS|MITIGATIONS|REPLACE_KERNELS|HOTSPOT_SSID|HOTSPOT_PASS)
+                ANS[$key]=${line#*=} ;;
+            *) err "Unknown answer '$key'" ;;
+        esac
+    done
+}
+
+apply_answers() {
+    hr "Your Choices"
+    local i problem
+    load_keyboards
+    for i in "${!KB_NAME[@]}"; do
+        if [[ "${KB_NAME[i]}" == "${ANS[KEYBOARD]:-}" ]]; then
+            KEYBOARD_NAME=${KB_NAME[i]}; KEYMAP=${KB_KM[i]}
+            KEYMAP_X11=${KB_XKB[i]}; KEYMAP_X11_VARIANT=${KB_VAR[i]}
+            break
+        fi
+    done
+    [[ -n "$KEYBOARD_NAME" ]] || err "Unknown keyboard layout: '${ANS[KEYBOARD]:-}'"
+
+    HOSTNAME=${ANS[HOSTNAME]:-niixarch}
+    problem=$(hostname_problem "$HOSTNAME") || err "Computer name: $problem"
+    USERNAME=${ANS[USERNAME]:-}
+    problem=$(username_problem "$USERNAME") || err "Username: $problem"
+    USER_PASS=${ANS[USER_PASS]:-}
+    [[ -n "$USER_PASS" ]] || err "The password cannot be empty."
+    LUKS_PASS=${ANS[LUKS_PASS]:-}
+    (( ${#LUKS_PASS} >= 8 )) || err "The disk password must be at least 8 characters."
+    TIMEZONE=${ANS[TIMEZONE]:-}
+    [[ "$TIMEZONE" != *..* && -f "/usr/share/zoneinfo/$TIMEZONE" ]] || err "Unknown time zone: '$TIMEZONE'"
+    case "${ANS[MITIGATIONS]:-}" in
+        off) USE_MITIGATIONS=false ;;
+        on)  USE_MITIGATIONS=true ;;
+        *)   err "MITIGATIONS must be 'on' or 'off'." ;;
+    esac
+    HOTSPOT_SSID=${ANS[HOTSPOT_SSID]:-}
+    HOTSPOT_PASS=${ANS[HOTSPOT_PASS]:-}
+    if [[ -n "$HOTSPOT_SSID$HOTSPOT_PASS" ]]; then
+        problem=$(hotspot_problem "$HOTSPOT_SSID" "$HOTSPOT_PASS") || err "Hotspot: $problem"
+    fi
+
+    case "${ANS[MODE]:-}" in
+        dualboot)
+            windows_present || err "Dual-boot was chosen, but no Windows install was found."
+            locate_efi || err "No EFI system partition was found on an internal drive."
+            [[ -n "${ANS[TARGET_REGION]:-}${ANS[DELETE_PART]:-}" ]] || err "No place to install was chosen." ;;
+        singleboot)
+            internal_disks | grep -qxF -- "${ANS[SINGLE_DRIVE]:-}" || err "The chosen drive is not an internal drive here."
+            SINGLE_DRIVE=${ANS[SINGLE_DRIVE]} ;;
+        *)  err "No install mode given." ;;
+    esac
+    INSTALL_MODE=${ANS[MODE]}
+    log "Mode $INSTALL_MODE, keyboard $KEYBOARD_NAME (console $KEYMAP), time zone $TIMEZONE, user $USERNAME"
+    detect_hardware
+}
+
+# -- Hardware
+# The same tools the installed system runs at boot, so both agree.
+detect_hardware() {
+    local key value
+    CPU_MODEL=$(grep -m1 "model name" /proc/cpuinfo | cut -d: -f2 | xargs)
+    case "$(grep -m1 '^vendor_id' /proc/cpuinfo)" in
+        *AuthenticAMD*) CPU_VENDOR=amd ;;
+        *GenuineIntel*) CPU_VENDOR=intel ;;
+        *)              CPU_VENDOR=unknown ;;
+    esac
+    while IFS='=' read -r key value; do
+        case "$key" in
+            GPU_COUNT) GPU_COUNT=$value ;;  GPU_NVIDIA) HAS_NVIDIA=$value ;;
+            GPU_AMD)   HAS_AMD=$value ;;    GPU_INTEL)  HAS_INTEL=$value ;;
+            GPU_VENDOR) GPU_VENDOR=$value ;; GPU_KIND)  GPU_KIND=$value ;;
+            GPU_NAME)  GPU_MODEL=$value ;;
+        esac
+    done < <(niix-gpu detect 2>/dev/null)
+    [[ "$GPU_VENDOR" == other ]] && GPU_VENDOR=""
+    while IFS='=' read -r key value; do
+        case "$key" in
+            FORM) FORM=$value ;; HANDHELD) HANDHELD=$value ;; VIRT) VIRT=$value ;;
+            CPU_X3D) CPU_X3D=$value ;; CPU_HYBRID) CPU_HYBRID=$value ;;
+        esac
+    done < <(niix-hardware detect 2>/dev/null)
+    MEM_TOTAL_GB=$(( $(awk '/MemTotal/ {print $2}' /proc/meminfo) / 1024 / 1024 ))
+    log "CPU: $CPU_MODEL ($CPU_VENDOR)"
+    log "GPU: ${GPU_MODEL:-not detected}${GPU_VENDOR:+ ($GPU_VENDOR, the most powerful of $GPU_COUNT)}"
+    log "Machine: $(machine_description), RAM ~${MEM_TOTAL_GB} GB"
+}
+
+machine_description() {
+    local text
+    case "$FORM" in
+        laptop)   text="laptop" ;;
+        handheld) text="handheld (${HANDHELD:-unknown model})" ;;
+        vm)       text="virtual machine (${VIRT:-unknown})" ;;
+        *)        text="desktop" ;;
+    esac
+    [[ "$CPU_X3D" == yes ]] && text+=", Ryzen X3D (games kept on the cache cores)"
+    [[ "$CPU_HYBRID" == yes ]] && text+=", Intel performance + efficiency cores"
+    printf '%s' "$text"
+}
+
+# -- The disk
+prepare_disk() {
+    hr "Preparing the Disk"
+    if [[ "$INSTALL_MODE" == dualboot ]]; then
+        if [[ -n "${ANS[TARGET_REGION]:-}" ]]; then
+            local line found=""
+            while IFS= read -r line; do
+                [[ "$line" == "${ANS[TARGET_REGION]}|"* ]] && found=$line
+            done < <(list_free_regions)
+            [[ -n "$found" ]] || err "The chosen free space is no longer there - start the installer again."
+            IFS='|' read -r TARGET_DRIVE FREE_START FREE_END _ _ <<< "$found"
+        else
+            delete_partition "${ANS[DELETE_PART]}"
+        fi
+        create_partition
+    else
+        wipe_single_drive
+        create_singleboot_partitions
+    fi
+    dump_state "after partitioning"
+}
+
+# Releases everything the live session may hold on a partition: mounts,
+# swap, and LVM or LUKS devices on top of it (innermost first).
+release_partition() {
+    local part=$1 dev type
+    while read -r dev; do
+        [[ -n "$dev" ]] && { umount -R "$dev" 2>/dev/null || umount -l "$dev" 2>/dev/null || true; }
+    done < <(lsblk -lnpo MOUNTPOINTS "$part" 2>/dev/null | awk NF)
+    swapoff "$part" 2>/dev/null || true
+    while read -r dev type; do
+        swapoff "$dev" 2>/dev/null || true
+        case "$type" in
+            lvm)   dmsetup remove "$dev" 2>/dev/null || true ;;
+            crypt) cryptsetup close "$dev" 2>/dev/null || true ;;
+        esac
+    done < <(lsblk -lnpo NAME,TYPE "$part" 2>/dev/null | tail -n +2 | tac)
+}
+
+delete_partition() {
+    local part=$1 line="" num drive start end region gib
+    while IFS= read -r line; do
+        [[ "${line%%|*}" == "$part" ]] && break
+        line=""
+    done < <(list_deletable_partitions)
+    [[ -n "$line" ]] || err "The partition chosen for deletion is no longer there - start the installer again."
+    IFS='|' read -r _ _ _ drive _ <<< "$line"
+    num=$(part_number "$part")
+    IFS=: read -r _ start end _ < <(parted -m "$drive" unit MiB print 2>/dev/null | grep "^$num:")
+    start=${start%MiB}; end=${end%MiB}
+    release_partition "$part"
+    info "Deleting $part..."
+    wipefs -a "$part" >/dev/null 2>&1 || true
+    parted -s "$drive" rm "$num" || err "Could not delete $part - is something still using it?"
+    partprobe "$drive" 2>/dev/null || true
+    udevadm settle --timeout=10 || true
+    # The free space the partition leaves behind (merged with any next to it).
+    region=$(parted -m "$drive" unit MiB print free 2>/dev/null | awk -F: -v ps="${start%.*}" -v pe="${end%.*}" '
+        $NF ~ /free/ { s = $2; e = $3; gsub(/MiB/, "", s); gsub(/MiB/, "", e)
+            if (s <= ps + 1 && e >= pe - 1) { printf "%s|%s|%.0f", s, e, (e - s) / 1024; exit } }')
+    [[ -n "$region" ]] || err "The space of $part did not become free on $drive"
+    IFS='|' read -r FREE_START FREE_END gib <<< "$region"
+    TARGET_DRIVE=$drive
+    log "Freed ~${gib} GiB on $drive"
+}
+
+create_partition() {
+    local before new_name="" try
+    info "Creating the NiiX partition on $TARGET_DRIVE..."
+    before=$(lsblk -lno NAME "$TARGET_DRIVE" | sort)
+    parted -s "$TARGET_DRIVE" mkpart primary "${FREE_START}MiB" "$(( ${FREE_END%.*} - 1 ))MiB" \
+        || err "Could not create a partition on $TARGET_DRIVE"
+    partprobe "$TARGET_DRIVE" 2>/dev/null || true
+    for (( try = 0; try < 20; try++ )); do
+        udevadm settle --timeout=5 2>/dev/null || true
+        new_name=$(comm -13 <(printf '%s\n' "$before") <(lsblk -lno NAME "$TARGET_DRIVE" | sort) | head -1)
+        [[ -n "$new_name" && -b "/dev/$new_name" ]] && break
+        sleep 0.5
+    done
+    [[ -n "$new_name" ]] || err "The new partition did not appear on $TARGET_DRIVE"
+    LUKS_PART=/dev/$new_name
+    parted -s "$TARGET_DRIVE" type "$(part_number "$LUKS_PART")" 0FC63DAF-8483-4772-8E79-3D69D8477DE4 2>/dev/null || true
+    log "New partition: $LUKS_PART"
+}
+
+wipe_single_drive() {
+    info "Wiping $SINGLE_DRIVE..."
+    lsblk -lno NAME,TYPE "$SINGLE_DRIVE" | awk '$2 == "crypt" {print $1}' \
+        | while read -r name; do cryptsetup close "$name" 2>/dev/null || true; done
+    lsblk -lno MOUNTPOINT "$SINGLE_DRIVE" | awk 'NF' | while read -r mnt; do umount "$mnt" 2>/dev/null || true; done
+    swapoff -a 2>/dev/null || true
+    wipefs -a "$SINGLE_DRIVE"        || err "wipefs failed on $SINGLE_DRIVE"
+    sgdisk --zap-all "$SINGLE_DRIVE" || err "sgdisk --zap-all failed on $SINGLE_DRIVE"
+    dd if=/dev/zero of="$SINGLE_DRIVE" bs=1M count=10 conv=fsync 2>/dev/null || err "Could not clear $SINGLE_DRIVE"
+    partprobe "$SINGLE_DRIVE" 2>/dev/null || true
+    udevadm settle --timeout=10 || true
+    log "$SINGLE_DRIVE wiped"
+}
+
+create_singleboot_partitions() {
+    local try
+    parted -s "$SINGLE_DRIVE" mklabel gpt                          || err "Could not create a partition table on $SINGLE_DRIVE"
+    parted -s "$SINGLE_DRIVE" mkpart EFI fat32 1MiB 1025MiB        || err "Could not create the EFI partition"
+    parted -s "$SINGLE_DRIVE" set 1 esp on                         || err "Could not mark the EFI partition"
+    parted -s "$SINGLE_DRIVE" mkpart niix 1025MiB 100%             || err "Could not create the system partition"
+    partprobe "$SINGLE_DRIVE" 2>/dev/null || true
+    EFI_PART=$(part_path "$SINGLE_DRIVE" 1)
+    LUKS_PART=$(part_path "$SINGLE_DRIVE" 2)
+    for (( try = 0; try < 20; try++ )); do
+        [[ -b "$EFI_PART" && -b "$LUKS_PART" ]] && break
+        udevadm settle --timeout=5 2>/dev/null || true
+        sleep 0.5
+    done
+    [[ -b "$EFI_PART" && -b "$LUKS_PART" ]] || err "The new partitions did not appear on $SINGLE_DRIVE"
+    EFI_DRIVE=$SINGLE_DRIVE; EFI_PART_NUM=1; TARGET_DRIVE=$SINGLE_DRIVE
+    mkfs.fat -F32 -n EFI "$EFI_PART" || err "Could not format $EFI_PART"
+    log "EFI partition $EFI_PART (1 GiB), system partition $LUKS_PART"
+}
+
+setup_luks() {
+    hr "LUKS2 Encryption Setup"
+    printf '%s' "$LUKS_PASS" | cryptsetup luksFormat --batch-mode --type luks2 "$LUKS_PART" --key-file=- \
+        || err "Encrypting $LUKS_PART failed"
+    LUKS_UUID=$(blkid -s UUID -o value "$LUKS_PART")
+    [[ -n "$LUKS_UUID" ]] || err "Could not read the UUID of $LUKS_PART"
+    printf '%s' "$LUKS_PASS" | cryptsetup open "$LUKS_PART" "$MAPPER" --key-file=- \
+        || err "Could not open the encrypted partition"
+    log "Encrypted: $LUKS_PART (UUID $LUKS_UUID)"
+}
+
+setup_btrfs() {
+    hr "Btrfs Filesystem"
+    local sub
+    mkfs.btrfs -f "/dev/mapper/$MAPPER" || err "mkfs.btrfs failed"
+    mount "/dev/mapper/$MAPPER" /mnt || err "Could not mount the new file system"
+    for sub in @ @home @snapshots @var_log; do
+        btrfs subvolume create "/mnt/$sub" >/dev/null || err "Could not create subvolume $sub"
+    done
+    umount /mnt
+    mount -o "$BTRFS_OPTS,subvol=@" "/dev/mapper/$MAPPER" /mnt || err "Could not mount @"
+    mkdir -p /mnt/{boot,home,.snapshots,var/log}
+    mount "$EFI_PART" /mnt/boot || err "Could not mount the EFI partition $EFI_PART"
+    mount -o "$BTRFS_OPTS,subvol=@home"      "/dev/mapper/$MAPPER" /mnt/home       || err "Could not mount @home"
+    mount -o "$BTRFS_OPTS,subvol=@snapshots" "/dev/mapper/$MAPPER" /mnt/.snapshots || err "Could not mount @snapshots"
+    mount -o "$BTRFS_OPTS,subvol=@var_log"   "/dev/mapper/$MAPPER" /mnt/var/log    || err "Could not mount @var_log"
+    log "Btrfs mounted"
+}
+
+# Removes boot files of earlier installs. Never Windows', and another
+# system's kernels only with REPLACE_KERNELS=yes.
+clean_efi() {
+    hr "EFI Partition Cleanup"
+    local -a stale
+    mapfile -t stale < <(esp_kernels /mnt/boot)
+    if (( ${#stale[@]} )); then
+        if ! niix_owns_esp /mnt/boot && [[ "${ANS[REPLACE_KERNELS]:-no}" != yes ]]; then
+            err "The EFI partition holds another Linux install's kernels - not replacing them without consent."
+        fi
+        rm -f "${stale[@]}"
+    fi
+    rm -rf /mnt/boot/limine /mnt/boot/EFI/limine
+    rm -f /mnt/boot/limine.cfg /mnt/boot/limine.conf
+    remove_boot_entries "limine|arch|NiiX"
+    log "EFI partition cleaned (Windows and other boot loaders untouched)"
+}
+
+remove_boot_entries() {
+    local num
+    while IFS= read -r num; do
+        efibootmgr -b "$num" -B >/dev/null 2>&1 && log "Removed UEFI entry Boot$num"
+    done < <(efibootmgr 2>/dev/null | grep -iE "$1" | grep -oP '^Boot\K[0-9A-Fa-f]{4}')
+}
+
+# -- Copying the system
+# The read-only image under the live session (the overlay's lower layer).
+live_image() {
+    local lower dir
+    lower=$(findmnt -n -o OPTIONS --target / | tr ',' '\n' | sed -n 's/^lowerdir+\{0,1\}=//p' | tail -1)
+    for dir in "${lower##*:}" /run/archiso/airootfs /run/archiso/sfs/airootfs; do
+        [[ -n "$dir" && -f "$dir/usr/local/lib/niix/live-files" ]] && { printf '%s\n' "$dir"; return 0; }
+    done
+    return 1
+}
+
+# The squashfs file behind it, on the stick or in RAM.
+live_squashfs() {
+    local dir dev file
+    dir=$(live_image) || return 1
+    dev=$(findmnt -n -o SOURCE --mountpoint "$dir") || return 1
+    [[ "$dev" == /dev/loop* ]] || return 1
+    file=$(losetup -n -O BACK-FILE "$dev" | head -n1 | sed 's/[[:space:]]*$//')
+    [[ -f "$file" ]] && printf '%s\n' "$file"
+}
+
+# Turns unsquashfs/rsync percentages into @@substep lines for the GUI.
+progress_filter() {
+    awk 'BEGIN { RS = "[\r\n]+"; last = -1 }
+        { for (i = 1; i <= NF; i++) { v = $i; sub(/%$/, "", v)
+            if (v ~ /^[0-9]+$/ && v <= 100 && v != last) { print "@@substep " v; last = v; fflush() } } }'
+}
+
+copy_system() {
+    hr "Copying the System"
+    local src sfs rc
+    src=$(live_image) || err "The live system image was not found."
+    # unsquashfs uses every core; rsync from the mounted image is the fallback.
+    if sfs=$(live_squashfs); then
+        unsquashfs -f -d /mnt -p "$(nproc)" -percentage -excludes "$sfs" /boot | progress_filter
+        rc=${PIPESTATUS[0]}
+    else
+        rsync -aHAX --numeric-ids --no-inc-recursive --info=progress2 --exclude=/boot "$src/" /mnt/ | progress_filter
+        rc=${PIPESTATUS[0]}
+    fi
+    (( rc == 0 )) || err "Copying the system failed - is the disk full? Check the log."
+    log "System copied"
+
+    install_kernel_image
+    remove_live_only
+    rm -f /mnt/etc/machine-id
+    arch-chroot /mnt systemd-machine-id-setup >/dev/null || err "Could not create a machine ID"
+}
+
+# The kernel package keeps vmlinuz next to its modules; Limine loads it from the ESP.
+install_kernel_image() {
+    local kdir n=0
+    for kdir in /mnt/usr/lib/modules/*/; do
+        [[ -f "${kdir}vmlinuz" && "$(cat "${kdir}pkgbase" 2>/dev/null)" == linux-cachyos ]] || continue
+        install -m 644 "${kdir}vmlinuz" /mnt/boot/vmlinuz-linux-cachyos || err "Could not copy the kernel (is the EFI partition full?)"
+        n=$(( n + 1 ))
+    done
+    (( n == 1 )) || err "Expected one CachyOS kernel in the system, found $n"
+}
+
+remove_live_only() {
+    local entry
+    local -a pkgs=()
+    while IFS= read -r entry; do
+        case "$entry" in
+            pkg:*) pkgs+=("${entry#pkg:}") ;;
+            /?*)   [[ "$entry" == *..* ]] || rm -rf -- "/mnt${entry:?}" ;;
+        esac
+    done < <(grep -v '^#' /usr/local/lib/niix/live-files)
+    # The image's compiled settings still hold the live session's (its dock,
+    # no screen lock, no suspend) until the database is rebuilt without them.
+    arch-chroot /mnt dconf update || err "Could not rebuild the system settings (dconf update)"
+    if (( ${#pkgs[@]} )) && ! arch-chroot /mnt pacman -R --noconfirm "${pkgs[@]}" >/dev/null 2>&1; then
+        for entry in "${pkgs[@]}"; do
+            arch-chroot /mnt pacman -R --noconfirm "$entry" >/dev/null 2>&1 || warn "Could not remove $entry"
+        done
+    fi
+    log "Live-session files removed"
+}
+
+# -- Package sources
+timezone_country() {
+    awk -F'\t' -v tz="$TIMEZONE" '$3 == tz { print $1; exit }' /usr/share/zoneinfo/zone.tab 2>/dev/null
+}
+
+# The fastest mirrors in the time zone's country, else worldwide.
+pick_mirrors() {
+    local country servers=0 list=/etc/pacman.d/mirrorlist
+    cp "$list" "$list.iso"
+    country=$(timezone_country)
+    if [[ -n "$country" ]]; then
+        reflector --country "$country" --protocol https --age 24 --latest 10 --sort rate \
+            --threads 4 --download-timeout 4 --connection-timeout 4 --save "$list" 2>/dev/null
+        servers=$(grep -c '^Server' "$list")
+    fi
+    if (( servers < 3 )); then
+        country=""
+        reflector --protocol https --age 12 --latest 25 --fastest 10 \
+            --threads 4 --download-timeout 4 --connection-timeout 4 --save "$list" 2>/dev/null
+        servers=$(grep -c '^Server' "$list")
+    fi
+    if (( servers > 0 )); then
+        log "Mirrors: the $servers fastest${country:+ in $country}"
+    else
+        cp "$list.iso" "$list"
+        warn "Mirror ranking failed - using the worldwide fallback"
+    fi
+}
+
+# On an x86-64-v4 CPU, CachyOS's v4 repos go above the v3 ones (same
+# versions, so nothing is downloaded again).
+write_pacman_conf() {
+    if (( $(cpu_level) == 4 )); then
+        awk '
+            /^Architecture = / { print "Architecture = x86_64 x86_64_v3 x86_64_v4"; next }
+            /^\[cachyos-v3\]$/ {
+                n = split("cachyos-v4 cachyos-core-v4 cachyos-extra-v4", r, " ")
+                for (i = 1; i <= n; i++) printf "[%s]\nInclude = /etc/pacman.d/cachyos-v4-mirrorlist\n\n", r[i]
+            }
+            { print }' "$NIIX_SHARE/pacman.conf" > /mnt/etc/pacman.conf || err "Could not write pacman.conf"
+        log "Package sources: CachyOS x86-64-v4 + v3 builds, Arch, multilib"
+    else
+        install -m 644 "$NIIX_SHARE/pacman.conf" /mnt/etc/pacman.conf
+        log "Package sources: CachyOS x86-64-v3 builds, Arch, multilib"
+    fi
+}
+
+configure_pacman() {
+    hr "Package Sources"
+    pick_mirrors
+    install -m 644 /etc/pacman.d/mirrorlist /mnt/etc/pacman.d/mirrorlist
+    write_pacman_conf
+    (( ${#FLATPAK_APPS[@]} )) && start_background flatpak download_flatpaks "${FLATPAK_APPS[@]}"
+
+    # Build the boot image once at the end instead of after every kernel or
+    # firmware update below; rebuild_initramfs removes this override.
+    mkdir -p /mnt/etc/pacman.d/hooks
+    ln -sf /dev/null /mnt/etc/pacman.d/hooks/90-mkinitcpio-install.hook
+
+    # Take over the keyring pacman-init made at this boot, as pacstrap does;
+    # make a fresh one only if that one is missing or broken.
+    if systemctl is-active --quiet pacman-init.service \
+        && rsync -a --delete --exclude='S.*' --exclude='*.lock' /etc/pacman.d/gnupg/ /mnt/etc/pacman.d/gnupg/ \
+        && arch-chroot /mnt pacman-key --list-keys "$CACHYOS_KEY_FPR" >/dev/null 2>&1; then
+        log "Signing keys ready"
+    else
+        rm -rf /mnt/etc/pacman.d/gnupg
+        if ! arch-chroot /mnt pacman-key --init >/dev/null 2>&1 \
+                || ! arch-chroot /mnt pacman-key --populate >/dev/null 2>&1; then
+            err "Could not set up pacman's signing keys"
+        fi
+        log "Signing keys created"
+    fi
+    arch-chroot /mnt gpgconf --homedir /etc/pacman.d/gnupg --kill all 2>/dev/null || true
+    harden_dns
+}
+
+# A real resolv.conf in the chroot with public fallbacks, in case the live
+# session's resolver dies mid-install.
+harden_dns() {
+    local rc=/mnt/etc/resolv.conf
+    umount "$rc" 2>/dev/null || true
+    rm -f "$rc"
+    cat /etc/resolv.conf > "$rc" 2>/dev/null || true
+    printf 'nameserver 1.1.1.1\nnameserver 9.9.9.9\noptions timeout:2 attempts:3 rotate\n' >> "$rc"
+}
+
+wait_for_dns() {
+    local i
+    for (( i = 0; i < 12; i++ )); do
+        arch-chroot /mnt getent hosts archlinux.org &>/dev/null && return 0
+        harden_dns
+        sleep 5
+    done
+    return 1
+}
+
+# pacman in the target, 3 tries: a DNS hiccup looks like a missing package.
+chroot_pacman() {
+    local n
+    for (( n = 1; n <= 3; n++ )); do
+        arch-chroot /mnt pacman "$@" && return 0
+        (( n < 3 )) || break
+        warn "pacman failed - checking DNS and retrying ($n/3)..."
+        wait_for_dns || true
+        arch-chroot /mnt pacman -Syy --noconfirm 2>/dev/null || true
+    done
+    return 1
+}
+
+# Never fatal: falls back to one package at a time.
+chroot_install() {
+    local p
+    chroot_pacman -S --noconfirm --needed "$@" && return 0
+    for p in "$@"; do chroot_pacman -S --noconfirm --needed "$p" || warn "Could not install: $p"; done
+}
+
+retry3() {
+    local label=$1 n
+    shift
+    for n in 1 2 3; do
+        "$@" && return 0
+        (( n < 3 )) && { warn "$label: attempt $n/3 failed, retrying..."; sleep 5; }
+    done
+    warn "$label failed after 3 attempts"
+    return 1
+}
+
+# -- Downloads alongside the install
+target_flatpak() {
+    FLATPAK_SYSTEM_DIR=/mnt/var/lib/flatpak TMPDIR=/mnt/var/tmp flatpak --system "$@"
+}
+
+download_flatpaks() {
+    local app
+    retry3 "Flathub" target_flatpak remote-add --if-not-exists flathub https://dl.flathub.org/repo/flathub.flatpakrepo || return 1
+    retry3 "Flatpak apps" target_flatpak install -y --noninteractive flathub "$@" && return 0
+    for app in "$@"; do
+        target_flatpak info "$app" &>/dev/null || retry3 "$app" target_flatpak install -y --noninteractive flathub "$app" || true
+    done
+}
+
+# start_background NAME CMD... - CMD must never call err.
+start_background() {
+    local name=$1
+    shift
+    mkdir -p "$DL_DIR" || return 0
+    ( trap - INT TERM EXIT; "$@" ) > "$DL_DIR/$name.log" 2>&1 &
+    DL_PIDS+=("$!")
+}
+
+kill_tree() {
+    local child
+    for child in $(pgrep -P "$1" 2>/dev/null); do kill_tree "$child"; done
+    kill "$1" 2>/dev/null || true
+}
+
+stop_downloads() {
+    local pid
+    for pid in "${DL_PIDS[@]}"; do kill_tree "$pid"; wait "$pid" 2>/dev/null || true; done
+    DL_PIDS=()
+}
+
+finish_downloads() {
+    local pid waited=0 still log
+    (( ${#DL_PIDS[@]} )) || return 0
+    while true; do
+        still=false
+        for pid in "${DL_PIDS[@]}"; do kill -0 "$pid" 2>/dev/null && still=true; done
+        $still || break
+        (( waited % 30 == 0 )) && info "Still downloading the apps - $(du -smc /mnt/var/lib/flatpak 2>/dev/null | awk 'END {print $1}') MB so far"
+        sleep 5
+        waited=$(( waited + 5 ))
+    done
+    for pid in "${DL_PIDS[@]}"; do wait "$pid" 2>/dev/null || true; done
+    DL_PIDS=()
+    for log in "$DL_DIR"/*.log; do
+        [[ -s "$log" ]] && { echo "---- $(basename "$log" .log) ----"; tr '\r' '\n' < "$log" | grep -v '^\s*$' | tail -n 30; }
+    done
+}
+
+# -- Updates and the hardware's packages
+update_system() {
+    hr "System Update"
+    info "Downloading what is newer than this ISO..."
+    chroot_pacman -Syu --noconfirm || err "The system update failed after 3 attempts - check the internet connection and the log."
+    log "System up to date"
+
+    local -a add=() services=()
+    local dev
+    case "$CPU_VENDOR" in
+        amd)   arch-chroot /mnt pacman -Rns --noconfirm intel-ucode &>/dev/null || true ;;
+        intel) arch-chroot /mnt pacman -Rns --noconfirm amd-ucode &>/dev/null || true ;;
+    esac
+    (( HAS_INTEL + HAS_AMD + HAS_NVIDIA == 0 )) && add+=(vulkan-swrast lib32-vulkan-swrast)
+    [[ "$GPU_VENDOR" == amd ]] && add+=(corectrl)
+    case "$VIRT" in
+        kvm|qemu) add+=(qemu-guest-agent spice-vdagent); services+=(qemu-guest-agent) ;;
+        oracle)   add+=(virtualbox-guest-utils);         services+=(vboxservice) ;;
+        vmware)   add+=(open-vm-tools);                  services+=(vmtoolsd vmware-vmblock-fuse) ;;
+    esac
+    # Handheld Daemon turns built-in controls into a controller. Steam drives
+    # the Deck's itself.
+    if [[ "$FORM" == handheld && "$HANDHELD" != steamdeck ]]; then
+        add+=(hhd)
+        HHD_WANTED=true
+    fi
+    # xone only with an Xbox Wireless Adapter, since it replaces xpad.
+    for dev in /sys/bus/usb/devices/*; do
+        [[ "$(cat "$dev/idVendor" 2>/dev/null)" == 045e ]] || continue
+        case "$(cat "$dev/idProduct" 2>/dev/null)" in 02e6|02f9|02fe|091e) add+=(xone-dkms); break ;; esac
+    done
+    if (( ${#add[@]} )); then
+        info "For this hardware: ${add[*]}"
+        chroot_install "${add[@]}"
+    fi
+    (( ${#services[@]} )) && { arch-chroot /mnt systemctl enable "${services[@]}" 2>/dev/null || warn "Could not enable the guest services"; }
+    return 0
+}
+
+install_gpu_drivers() {
+    hr "Graphics Drivers"
+    # Mesa is in the image for every vendor. chwd picks NVIDIA's driver:
+    # nvidia-open for Turing and newer, 580xx for Maxwell/Pascal, 470xx for Kepler.
+    if (( HAS_NVIDIA == 0 )); then
+        log "Open Mesa drivers (in the image)"
+        return 0
+    fi
+    info "NVIDIA graphics - installing NVIDIA's driver..."
+    arch-chroot /mnt chwd -a 0300 || { sleep 3; arch-chroot /mnt chwd -f -a 0300; } \
+        || warn "chwd reported problems - see 'sudo chwd --list' after the install"
+    if ! arch-chroot /mnt pacman -Q nvidia-utils &>/dev/null; then
+        warn "NVIDIA's driver was not installed - nouveau runs the card. Later: sudo chwd -a 0300"
+        return 0
+    fi
+    chroot_install nvidia-prime
+    rm -f /mnt/etc/modprobe.d/{no-nvidia,niix-disable-nvidia,nouveau-blacklist}.conf
+    # GDM only offers Wayland on NVIDIA with these services enabled.
+    arch-chroot /mnt systemctl enable nvidia-suspend.service nvidia-hibernate.service nvidia-resume.service 2>/dev/null \
+        || warn "Could not enable NVIDIA's suspend services"
+    cat >> /mnt/etc/profile.d/niixarch-gaming.sh <<'NVEOF'
+export __GL_THREADED_OPTIMIZATIONS=1
+export PROTON_ENABLE_NVAPI=1
+export PROTON_HIDE_NVIDIA_GPU=0
+NVEOF
+    log "NVIDIA driver installed - it takes over all rendering from the first boot"
+}
+
+# -- This machine's configuration
+configure_system() {
+    hr "System Configuration"
+    genfstab -U /mnt >> /mnt/etc/fstab || err "genfstab failed"
+    grep -qE '^[^#].*[[:space:]]/[[:space:]]+btrfs' /mnt/etc/fstab || err "fstab has no btrfs root entry"
+
+    ln -sf "/usr/share/zoneinfo/$TIMEZONE" /mnt/etc/localtime
+    arch-chroot /mnt hwclock --systohc 2>/dev/null || true
+    echo "KEYMAP=$KEYMAP" > /mnt/etc/vconsole.conf
+    echo "$HOSTNAME" > /mnt/etc/hostname
+    printf '127.0.0.1   localhost\n::1         localhost\n127.0.1.1   %s.localdomain %s\n' "$HOSTNAME" "$HOSTNAME" > /mnt/etc/hosts
+
+    # GNOME builds the user's input sources from this on first login.
+    mkdir -p /mnt/etc/X11/xorg.conf.d
+    {
+        printf 'Section "InputClass"\n    Identifier "system-keyboard"\n    MatchIsKeyboard "on"\n'
+        printf '    Option "XkbLayout" "%s"\n' "$KEYMAP_X11"
+        [[ -n "$KEYMAP_X11_VARIANT" ]] && printf '    Option "XkbVariant" "%s"\n' "$KEYMAP_X11_VARIANT"
+        printf 'EndSection\n'
+    } > /mnt/etc/X11/xorg.conf.d/00-keyboard.conf
+
+    # ZRAM: all of RAM on small machines, half on larger ones.
+    printf '[zram0]\nzram-size = %s\ncompression-algorithm = zstd\n' \
+        "$( (( MEM_TOTAL_GB <= 8 )) && echo ram || echo 'ram / 2')" > /mnt/etc/systemd/zram-generator.conf
+
+    # Wi-Fi country from the time zone: 5 GHz hotspot, all channels, full power.
+    local country
+    country=$(timezone_country)
+    [[ "$country" =~ ^[A-Z]{2}$ ]] && echo "options cfg80211 ieee80211_regdom=$country" > /mnt/etc/modprobe.d/90-niix-wifi-country.conf
+
+    # Networks joined on the live desktop connect on the first boot too.
+    local src
+    for src in /etc/NetworkManager/system-connections/*.nmconnection; do
+        [[ -f "$src" ]] || continue
+        install -m 600 "$src" /mnt/etc/NetworkManager/system-connections/
+    done
+
+    # The user. Passwords only travel over stdin.
+    printf '%s\n' "root:$USER_PASS" | arch-chroot /mnt chpasswd || err "Could not set the root password"
+    arch-chroot /mnt useradd -m -G wheel,audio,video,input,storage,optical -s /bin/bash "$USERNAME" \
+        || err "Could not create the user '$USERNAME'"
+    printf '%s\n' "$USERNAME:$USER_PASS" | arch-chroot /mnt chpasswd || err "Could not set the password of '$USERNAME'"
+
+    # Auto-login: the disk password is the one secret at power-on (shown on
+    # the summary page); the screen lock and sudo still ask for the password.
+    printf '[daemon]\nAutomaticLoginEnable=True\nAutomaticLogin=%s\n' "$USERNAME" > /mnt/etc/gdm/custom.conf
+
+    # No copy-on-write for the Steam library: rewritten game files fragment
+    # badly. It only applies to new files, so it has to be set before Steam runs.
+    # shellcheck disable=SC2016  # $HOME is the inner shell's
+    arch-chroot /mnt runuser -u "$USERNAME" -- env HOME="/home/$USERNAME" sh -c 'mkdir -p "$HOME/.local/share/Steam" && chattr +C "$HOME/.local/share/Steam"' 2>/dev/null || true
+
+    # Services only an installed system runs (the image enables the rest).
+    local svc failed=()
+    for svc in ufw.service niixarch-update.timer fstrim.timer snapper-cleanup.timer fwupd-refresh.timer \
+               niix-iconify.service niix-iconify.path niix-ntfs-mount.service niix-gpu-flatpak.service \
+               niix-performance-mode.service avahi-daemon.service paccache.timer "niix-steamvr-caps@$USERNAME.path"; do
+        arch-chroot /mnt systemctl enable "$svc" &>/dev/null || failed+=("$svc")
+    done
+    $HHD_WANTED && { arch-chroot /mnt systemctl enable "hhd@$USERNAME.service" &>/dev/null || failed+=("hhd@$USERNAME"); }
+    # Windows and NiiX share the Bluetooth address, so their pairing keys clash.
+    if windows_present; then
+        arch-chroot /mnt systemctl enable niix-bt-keysync.service &>/dev/null || failed+=(niix-bt-keysync.service)
+    fi
+    # Windows updates put Windows first in the boot order, skipping the NiiX menu.
+    if [[ "$INSTALL_MODE" == dualboot ]]; then
+        arch-chroot /mnt systemctl enable niix-boot-order.service &>/dev/null || failed+=(niix-boot-order.service)
+    fi
+    (( ${#failed[@]} )) && warn "Could not enable: ${failed[*]}"
+    [[ -L /mnt/etc/systemd/system/multi-user.target.wants/NetworkManager.service ]] \
+        || err "NetworkManager is not enabled in the image - the ISO is broken."
+
+    setup_hotspot
+
+    # Updates stop before they could leave boot files the PC cannot start
+    # from. Not in the image: its pre-transaction hook would run while the
+    # ISO is built, before there is a shell to run it.
+    install -m 644 "$NIIX_SHARE"/pacman-hooks/*.hook /mnt/etc/pacman.d/hooks/ \
+        || err "Could not install the boot-file checks"
+
+    # Snapshots only on the installed system; snap-pac only sees listed configs.
+    if grep -q '^SNAPPER_CONFIGS=' /mnt/etc/conf.d/snapper 2>/dev/null; then
+        sed -i 's/^SNAPPER_CONFIGS=.*/SNAPPER_CONFIGS="root"/' /mnt/etc/conf.d/snapper
+    else
+        mkdir -p /mnt/etc/conf.d && echo 'SNAPPER_CONFIGS="root"' >> /mnt/etc/conf.d/snapper
+    fi
+
+    rm -f /mnt/etc/resolv.conf
+    ln -s /run/systemd/resolve/stub-resolv.conf /mnt/etc/resolv.conf
+    log "Configured: $HOSTNAME, user $USERNAME, $KEYBOARD_NAME, $TIMEZONE"
+}
+
+# The same profile 'niix-hotspot setup' makes. The watchdog brings it up
+# whenever the computer is online.
+setup_hotspot() {
+    [[ -n "$HOTSPOT_SSID" ]] || return 0
+    local file=/mnt/etc/NetworkManager/system-connections/niix-hotspot.nmconnection
+    ( umask 077; cat > "$file" <<HSKEYEOF
+[connection]
+id=niix-hotspot
+uuid=$(cat /proc/sys/kernel/random/uuid)
+type=wifi
+autoconnect=false
+
+[wifi]
+band=bg
+channel=7
+mode=ap
+powersave=2
+ssid=$HOTSPOT_SSID
+
+[wifi-security]
+group=ccmp;
+key-mgmt=wpa-psk
+pairwise=ccmp;
+pmf=2
+proto=rsn;
+psk=${HOTSPOT_PASS//\\/\\\\}
+
+[ipv4]
+method=shared
+
+[ipv6]
+method=ignore
+HSKEYEOF
+    ) || { warn "Could not save the hotspot - set it up later: niix-hotspot start"; return 0; }
+    if arch-chroot /mnt systemctl enable niix-hotspot-watchdog.service &>/dev/null; then
+        log "Wi-Fi hotspot '$HOTSPOT_SSID' comes on whenever this computer is online"
+    else
+        warn "Hotspot saved, but auto mode is off - start it with: niix-hotspot start"
+    fi
+}
+
+# flatpak install only warns when a runtime extension fails to download, but
+# without the GL extension of its runtime an app has no graphics driver.
+# update fetches whatever related refs are still missing; the GL ones are
+# then checked by name.
+ensure_flatpak_gl() {
+    local runtime branch gl
+    target_flatpak update -y --noninteractive >/dev/null 2>&1 || true
+    while read -r runtime branch; do
+        case "$runtime" in
+            org.freedesktop.Platform)            gl=org.freedesktop.Platform.GL.default ;;
+            org.freedesktop.Platform.Compat.i386) gl=org.freedesktop.Platform.GL32.default ;;
+            *) continue ;;
+        esac
+        target_flatpak info "$gl" "$branch" &>/dev/null && continue
+        retry3 "$gl $branch" target_flatpak install -y --noninteractive flathub "$gl//$branch" \
+            || warn "$gl $branch is missing - Flatpak apps may not start until: flatpak update"
+    done < <(target_flatpak list --runtime --columns=application,branch 2>/dev/null | sort -u)
+}
+
+setup_apps() {
+    hr "Apps"
+    finish_downloads
+    local app
+    local -a missing=()
+    for app in "${FLATPAK_APPS[@]}"; do target_flatpak info "$app" &>/dev/null || missing+=("$app"); done
+    if (( ${#missing[@]} )); then
+        download_flatpaks "${missing[@]}" || true
+        for app in "${missing[@]}"; do
+            target_flatpak info "$app" &>/dev/null || warn "$app not installed - get it later from GNOME Software"
+        done
+    fi
+    (( ${#FLATPAK_APPS[@]} )) && ensure_flatpak_gl
+    rm -rf "$DL_DIR"
+    # ProtonUp-Qt stays out of the menu (Steam handles Proton; reversible with niix-unhide-app).
+    arch-chroot /mnt runuser -u "$USERNAME" -- env HOME="/home/$USERNAME" niix-hide-app net.davidotek.pupgui2 >/dev/null 2>&1 || true
+    arch-chroot /mnt niix-iconify --quiet 2>/dev/null || true
+    arch-chroot /mnt snapper --no-dbus -c root create --description "NiiX Arch - clean install" 2>/dev/null || true
+    log "Apps ready (${#FLATPAK_APPS[@]} from Flathub)"
+}
+
+# -- Booting
+rebuild_initramfs() {
+    hr "Initramfs Rebuild"
+    rm -f /mnt/etc/pacman.d/hooks/90-mkinitcpio-install.hook
+    install_kernel_image
+    rm -f /mnt/boot/initramfs-linux-cachyos-fallback.img
+    arch-chroot /mnt mkinitcpio -P || err "Building the boot image failed - the system would not start. Check the log."
+    [[ -s /mnt/boot/initramfs-linux-cachyos.img ]] || err "The boot image is missing after mkinitcpio"
+    local list
+    list=$(arch-chroot /mnt lsinitcpio /boot/initramfs-linux-cachyos.img 2>&1) || true
+    grep -q systemd-cryptsetup <<< "$list" \
+        || err "systemd-cryptsetup is not in the boot image - the disk could not be unlocked. Check the log."
+    log "Boot image ready (disk unlock prompt included)"
+}
+
+# @clean is a bootable copy of the fresh system, "NiiX Arch (clean state)".
+make_clean_snapshot() {
+    local top
+    CLEAN_OK=false
+    top=$(mktemp -d) || return 0
+    if mount -o subvol=/ "/dev/mapper/$MAPPER" "$top"; then
+        btrfs subvolume delete "$top/@clean" &>/dev/null || true
+        btrfs subvolume snapshot "$top/@" "$top/@clean" >/dev/null && CLEAN_OK=true
+        umount "$top"
+    fi
+    rmdir "$top"
+    if $CLEAN_OK; then
+        log "@clean snapshot created"
+    else
+        warn "@clean snapshot failed - later: sudo niixarch-refresh-clean"
+    fi
+}
+
+install_limine() {
+    hr "Limine Bootloader"
+    make_clean_snapshot
+    mkdir -p /mnt/boot/EFI/limine /mnt/boot/EFI/BOOT
+    cp /mnt/usr/share/limine/BOOTX64.EFI /mnt/boot/EFI/limine/BOOTX64.EFI || err "Could not copy Limine (EFI partition full?)"
+    # Some firmware only boots the fallback path.
+    cp /mnt/usr/share/limine/BOOTX64.EFI /mnt/boot/EFI/BOOT/BOOTX64.EFI || err "Could not copy the Limine fallback loader"
+
+    local cmdline="rd.luks.name=$LUKS_UUID=$MAPPER root=/dev/mapper/$MAPPER rootflags=subvol=@ rootfstype=btrfs rw"
+    case "$CPU_VENDOR" in
+        amd)   cmdline+=" amd_pstate=active split_lock_detect=off" ;;
+        intel) cmdline+=" intel_pstate=active split_lock_detect=off" ;;
+    esac
+    $USE_MITIGATIONS || cmdline+=" mitigations=off"
+    # 1000 Hz mouse polling, quiet boot, no watchdog, no zswap on top of ZRAM.
+    cmdline+=" usbhid.mousepoll=1 quiet loglevel=3 nowatchdog zswap.enabled=0 transparent_hugepage=madvise"
+    # Overdrive for CoreCtrl on AMD cards. 0xffffffff would also enable a
+    # feature that hangs GPUs.
+    [[ "$GPU_VENDOR" == amd && "$GPU_KIND" == discrete ]] && cmdline+=" amdgpu.ppfeaturemask=0xfff7ffff"
+
+    local windows="" clean="" default=1 timeout=2 cfg dst
+    if [[ "$INSTALL_MODE" == dualboot ]]; then
+        windows=$'/Windows Boot Manager\n    protocol: efi\n    path: boot():/EFI/Microsoft/Boot/bootmgfw.efi\n\n'
+        default=2; timeout=5
+    fi
+    $CLEAN_OK && clean="
+
+/NiiX Arch (clean state)
+    protocol: linux
+    path: boot():/vmlinuz-linux-cachyos
+    cmdline: ${cmdline/rootflags=subvol=@ /rootflags=subvol=@clean }
+    module_path: boot():/initramfs-linux-cachyos.img"
+    cfg="timeout: $timeout
+interface_branding: NiiX Arch
+interface_branding_colour: 6
+interface_help_hidden: yes
+default_entry: $default
+
+${windows}/NiiX Arch
+    protocol: linux
+    path: boot():/vmlinuz-linux-cachyos
+    cmdline: $cmdline
+    module_path: boot():/initramfs-linux-cachyos.img$clean"
+    for dst in /mnt/boot/EFI/limine/limine.conf /mnt/boot/EFI/BOOT/limine.conf; do
+        printf '%s\n' "$cfg" > "$dst" || err "Could not write $dst"
+    done
+
+    remove_boot_entries "NiiX Arch|Limine"
+    if efibootmgr --create --disk "$EFI_DRIVE" --part "$EFI_PART_NUM" --label "NiiX Arch (Limine)" \
+            --loader '\EFI\limine\BOOTX64.EFI' --unicode >/dev/null; then
+        log "Limine registered in the firmware"
+    else
+        warn "efibootmgr failed - the firmware will use the fallback \\EFI\\BOOT\\BOOTX64.EFI"
+    fi
+}
+
+finish() {
+    hr "Complete"
+    step_done
+    {
+        echo "==== BOOT CONFIGURATION ===="
+        cat /mnt/etc/fstab /mnt/boot/EFI/limine/limine.conf /mnt/etc/mkinitcpio.conf.d/*.conf
+        efibootmgr -v
+    } >> "$LOGFILE" 2>&1
+    info "Time per step:"
+    printf '      %s\n' "${STEP_TIMES[@]}"
+    log "NiiX Arch is installed - restart and remove the USB stick."
+    cp "$LOGFILE" /mnt/var/log/niixarch-install.log 2>/dev/null || true
+}
+
+# -- GUI entry points
+# What the GUI needs for its questions. Only @@ lines go to stdout.
+probe() {
+    local line path size model i
+    [[ $EUID -eq 0 ]] || { echo "@@error The check needs administrator rights"; exit 1; }
+    trap 'echo "@@error The hardware check stopped unexpectedly (exit code $?)."' EXIT
+    bitlocker_present && echo "@@bitlocker=yes"
+    if windows_present >&2; then
+        echo "@@windows=yes"
+        if locate_efi; then
+            echo "@@efi=$EFI_PART|$(lsblk -bno SIZE "$EFI_PART" | head -1 | tr -d '[:space:]')|$(efi_room)"
+            efi_has_foreign_kernels && echo "@@foreign_kernels=yes"
+        fi
+        while IFS= read -r line; do echo "@@region=$line"; done < <(list_free_regions)
+        while IFS= read -r line; do echo "@@partition=$line"; done < <(list_deletable_partitions)
+    else
+        echo "@@windows=no"
+    fi
+    while IFS= read -r path; do
+        big_enough "$path" || continue
+        size=$(lsblk -dno SIZE "$path" | tr -d '[:space:]')
+        model=$(lsblk -dno MODEL "$path")
+        echo "@@drive=$path|$size|${model:-Unknown}"
+    done < <(internal_disks)
+    load_keyboards
+    for i in "${!KB_NAME[@]}"; do echo "@@keyboard=${KB_NAME[i]}|$(typing_layout "$i")"; done
+    detect_hardware >&2
+    echo "@@machine=$(machine_description)"
+    echo "@@gpu=${GPU_MODEL:-unknown}"
+    if wifi_can_host; then echo "@@wifi_ap=yes"; else echo "@@wifi_ap=no"; fi
+    trap - EXIT
+    echo "@@probe_done"
+}
+
+check_account() {
+    local problem
+    problem=$(hostname_problem "${1:-}") || { echo "@@problem hostname $problem"; return; }
+    problem=$(username_problem "${2:-}") || { echo "@@problem username $problem"; return; }
+    echo "@@ok"
+}
+
+# -- Main
+case "${1:-}" in
+    --probe)         probe; exit 0 ;;
+    --check-account) check_account "${2:-}" "${3:-}"; exit 0 ;;
+    --answers)       read_answers ;;
+    *)               echo "Usage: niix-install --probe | --check-account HOST USER | --answers < answers" >&2; exit 2 ;;
+esac
+
+trap 'echo; warn "Interrupted - cleaning up"; release_target; exit 130' INT TERM
+dbg "NiiX build $(cat "$NIIX_SHARE/version" 2>/dev/null), kernel $(uname -r)"
+
+check_prereqs
+apply_answers
+prepare_disk
+setup_luks
+setup_btrfs
+clean_efi
+copy_system
+configure_pacman
+update_system
+install_gpu_drivers
+configure_system
+setup_apps
+rebuild_initramfs
+install_limine
+finish
+
+trap - INT TERM
+release_target
+echo "@@done"

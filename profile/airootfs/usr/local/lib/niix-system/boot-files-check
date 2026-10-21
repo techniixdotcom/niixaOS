@@ -1,0 +1,65 @@
+#!/bin/bash
+# boot-files-check pre|post - pacman hooks around the rebuild of the boot
+# image. Limine loads the kernel and boot image from the EFI partition at
+# /boot, which is often small when it is shared with Windows.
+#
+#   pre   stops the update before anything changes when the EFI partition is
+#         not mounted (the new kernel would land beside it and never boot)
+#         or too full to write the new boot image (mkinitcpio then overwrites
+#         the old one in place, and a full disk leaves neither)
+#   post  checks that the EFI partition holds the installed kernel and a
+#         readable boot image, and says loudly what to do if not
+set -uo pipefail
+
+BOOT=/boot
+KERNEL=$BOOT/vmlinuz-linux-cachyos
+IMAGE=$BOOT/initramfs-linux-cachyos.img
+MIB=1048576
+
+# Not on the live ISO, whose boot files are on the stick. The installer
+# builds the boot image once at the end and masks the rebuild until then.
+[ -e /etc/niix-live ] && exit 0
+[ "$(readlink /etc/pacman.d/hooks/90-mkinitcpio-install.hook 2>/dev/null)" = /dev/null ] && exit 0
+
+case "${1:-}" in
+    pre)
+        if ! mountpoint -q "$BOOT"; then
+            echo "==> ERROR: the EFI partition is not mounted at $BOOT - update stopped, nothing was changed."
+            echo "    Restart the computer, then update again. If this keeps happening: sudo mount $BOOT"
+            exit 1
+        fi
+        size=$(stat -c %s "$IMAGE" 2>/dev/null || echo 0)
+        free=$(( $(stat -f -c '%a * %S' "$BOOT") ))
+        # mkinitcpio needs room for a quarter more than the current image.
+        need=$(( size / 4 + 8 * MIB ))
+        if (( free < need )); then
+            echo "==> ERROR: the EFI partition is too full for the new boot image - update stopped, nothing was changed."
+            echo "    Free: $(( free / MIB )) MiB, needed: $(( need / MIB )) MiB. See what uses it: sudo du -sh $BOOT/* $BOOT/EFI/*"
+            exit 1
+        fi
+        ;;
+    post)
+        problem=""
+        kdir=""
+        for dir in /usr/lib/modules/*/; do
+            [ "$(cat "${dir}pkgbase" 2>/dev/null)" = linux-cachyos ] && [ -f "${dir}vmlinuz" ] && kdir=$dir
+        done
+        if [ -z "$kdir" ]; then
+            problem="no linux-cachyos kernel is installed"
+        elif ! cmp -s "${kdir}vmlinuz" "$KERNEL"; then
+            problem="$KERNEL is not the installed kernel"
+        elif [ ! -s "$IMAGE" ] || ! lsinitcpio "$IMAGE" >/dev/null 2>&1; then
+            problem="$IMAGE is missing or damaged"
+        fi
+        if [ -n "$problem" ]; then
+            echo "==> ERROR: the computer would not start: $problem."
+            echo "    Do NOT restart. Free space on the EFI partition if it is full, then run: sudo pacman -S linux-cachyos"
+            /usr/local/lib/niix-system/update-notify broken >/dev/null 2>&1 || true
+            exit 1
+        fi
+        ;;
+    *)
+        echo "usage: boot-files-check pre|post" >&2
+        exit 2 ;;
+esac
+exit 0

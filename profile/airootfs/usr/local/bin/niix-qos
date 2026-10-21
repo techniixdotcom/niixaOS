@@ -1,0 +1,674 @@
+#!/bin/bash
+# niix-qos - keeps games and calls responsive while something else uses the
+# whole connection (bufferbloat fix, CAKE).
+#
+#   niix-qos status         what is shaped, on which connection, and how
+#   niix-qos test           latency with and without load, with the current setup
+#   niix-qos measure        measure this network's speed again and use it
+#   niix-qos set DOWN UP    use these speeds (Mbit/s) for this network instead
+#                           of measuring; 0 leaves that direction alone
+#   niix-qos off            no shaping on this network
+#   niix-qos auto           forget this network's setting and measure again
+#   niix-qos disable|enable turn the whole thing off or on, on every network
+#   niix-qos apply          set up the current connection (NetworkManager runs
+#                           this on every connection change)
+#
+# How it works: a router or modem with big buffers lets a download or upload
+# fill them, and every other packet then waits behind it - ping jumps from
+# 15 ms to 300+ ms. Sending a little below the connection's real speed keeps
+# the queue here, where CAKE gives each flow its fair turn instead.
+#
+#  - It follows the connection that carries the internet (the default route):
+#    Ethernet, Wi-Fi, USB tethering - whichever is in use, also after
+#    switching. VPNs are covered: their traffic leaves through that connection.
+#  - Each network is measured once, when it is first used and the line is
+#    idle (never during a game), and remembered by its NetworkManager profile
+#    and its router. Metered connections (phone hotspots, mobile data) are
+#    never measured automatically.
+#  - Only internet traffic is shaped. The local network (NAS copies, VR
+#    streaming to a headset, Steam Remote Play) keeps its full speed.
+#  - A direction is left alone when the connection is about as fast as the
+#    network card itself, or faster than 1.5 Gbit/s - the card's own queue
+#    is then the bottleneck, and the kernel already keeps that one short.
+#
+# Settings: /etc/niix/qos.conf. niix.qos=off on the kernel command line turns
+# it off for one boot. Logs: journalctl -u niix-qos -u niix-qos-measure
+set -uo pipefail
+
+CONF=/etc/niix/qos.conf
+STATE_DIR=/var/lib/niix/qos
+RUN_DIR=/run/niix
+RUN_STATE=$RUN_DIR/qos.state
+LOCK=$RUN_DIR/qos.lock
+SYS=/sys/class/net
+
+# Cloudflare's speed test endpoints: no account, servers close to everyone.
+DOWN_URL=${NIIX_QOS_DOWN_URL:-"https://speed.cloudflare.com/__down?bytes=100000000"}
+UP_URL=${NIIX_QOS_UP_URL:-"https://speed.cloudflare.com/__up"}
+PING_HOST=${NIIX_QOS_PING_HOST:-one.one.one.one}
+# For testing in network namespaces: veth devices count as uplinks.
+TEST_ANY_DEV=${NIIX_QOS_TEST:-0}
+
+# Defaults (overridden by $CONF)
+QOS_MODE=auto
+DOWN_PERCENT=85
+UP_PERCENT=90
+MAX_SHAPE_MBIT=1500
+REMEASURE_DAYS=60
+CAKE_OVERHEAD="overhead 44 mpu 84"
+# shellcheck source=/dev/null
+[ -r "$CONF" ] && . "$CONF"
+
+# Never shaped: the local network, link-local and multicast. 100.64.0.0/10
+# (carrier-grade NAT) is not here - it is the ISP's side of the router.
+LOCAL_V4=(10.0.0.0/8 172.16.0.0/12 192.168.0.0/16 169.254.0.0/16 224.0.0.0/4 255.255.255.255/32)
+LOCAL_V6=(fe80::/10 fc00::/7 ff00::/8)
+
+say()  { printf '%s\n' "$*"; }
+warn() { printf 'niix-qos: %s\n' "$*" >&2; }
+
+usage() {
+    sed -n '2,15p' "$0" | sed 's/^# \{0,1\}//'
+}
+
+need_root() {
+    [ "$(id -u)" -eq 0 ] && return 0
+    exec sudo -- "$0" "$@"
+}
+
+is_live() { [ -e /etc/niix-live ]; }
+
+disabled_reason() {
+    if grep -qw 'niix.qos=off' /proc/cmdline 2>/dev/null; then
+        echo "turned off on the kernel command line (niix.qos=off)"
+    elif [ "$QOS_MODE" = off ]; then
+        echo "turned off in $CONF (niix-qos enable turns it back on)"
+    fi
+}
+
+# -- The uplink -------------------------------------------------------------
+
+# A real network device (Ethernet, Wi-Fi, USB tethering, a VM's NIC) - not a
+# VPN tunnel, bridge or our own shaping device. PPP (DSL modems in bridge
+# mode) also counts.
+is_uplink_candidate() {
+    local dev=$1
+    [ -d "$SYS/$dev" ] || return 1
+    case "$dev" in niixq*|lo) return 1 ;; ppp*) return 0 ;; esac
+    [ -e "$SYS/$dev/device" ] || [ "$TEST_ANY_DEV" = 1 ] || return 1
+    [ -d "$SYS/$dev/bridge" ] && return 1
+    return 0
+}
+
+# Prints "DEV GATEWAY" for the default route with the lowest metric (IPv4 or
+# IPv6). VPNs that route everything through themselves (wg-quick, NM's
+# WireGuard, OpenVPN's def1) keep the main table's default route, so this
+# is still the physical connection.
+find_uplink() {
+    { ip -4 route show default 2>/dev/null; ip -6 route show default 2>/dev/null; } | awk '
+        {
+            dev = ""; via = ""; metric = 0
+            for (i = 1; i < NF; i++) {
+                if ($i == "dev") dev = $(i + 1)
+                if ($i == "via") via = $(i + 1)
+                if ($i == "metric") metric = $(i + 1) + 0
+            }
+            if (dev != "") print metric, dev, (via == "" ? "-" : via)
+        }' | sort -n | while read -r _ dev via; do
+            if is_uplink_candidate "$dev"; then
+                echo "$dev $via"
+                break
+            fi
+        done
+}
+
+gateway_mac() {
+    local dev=$1 gw=$2 mac
+    [ "$gw" = "-" ] && return 0
+    mac=$(ip neigh show "$gw" dev "$dev" 2>/dev/null | awk '{for (i=1;i<NF;i++) if ($i=="lladdr") print $(i+1)}')
+    if [ -z "$mac" ]; then
+        ping -c1 -W1 -I "$dev" "$gw" >/dev/null 2>&1 || true
+        mac=$(ip neigh show "$gw" dev "$dev" 2>/dev/null | awk '{for (i=1;i<NF;i++) if ($i=="lladdr") print $(i+1)}')
+    fi
+    printf '%s' "$mac"
+}
+
+nm_field() { nmcli -g "$1" device show "$2" 2>/dev/null | head -1; }
+
+# A network = NetworkManager profile + the router's MAC address, so one
+# "Wired connection 1" plugged in at home and at work counts as two networks.
+network_key() {
+    local dev=$1 gw=$2 uuid mac
+    uuid=$(nm_field GENERAL.CON-UUID "$dev")
+    [ -n "$uuid" ] || uuid="dev-$dev"
+    mac=$(gateway_mac "$dev" "$gw")
+    mac=${mac//:/}
+    printf '%s%s' "$uuid" "${mac:+-$mac}"
+}
+
+network_name() {
+    local name
+    name=$(nm_field GENERAL.CONNECTION "$1")
+    printf '%s' "${name:-$1}"
+}
+
+is_metered() {
+    case "$(nm_field GENERAL.METERED "$1")" in
+        yes*) return 0 ;;
+    esac
+    return 1
+}
+
+# Link speed of the card in Mbit/s (Ethernet), 0 when unknown (Wi-Fi...).
+link_speed() {
+    local s
+    s=$(cat "$SYS/$1/speed" 2>/dev/null) || s=0
+    [[ "$s" =~ ^[0-9]+$ ]] || s=0
+    echo "$s"
+}
+
+# -- Stored settings per network ----------------------------------------------
+
+load_network() {
+    DOWN_KBIT=0; UP_KBIT=0; SOURCE=""; MEASURED_AT=0
+    local f=$STATE_DIR/$1
+    [ -r "$f" ] || return 1
+    # shellcheck source=/dev/null
+    . "$f"
+    return 0
+}
+
+save_network() {
+    local key=$1 name=$2 down=$3 up=$4 source=$5
+    mkdir -p "$STATE_DIR"
+    {
+        echo "# niix-qos: $name - written $(date '+%Y-%m-%d %H:%M')"
+        printf 'NAME=%q\n' "$name"
+        echo "SOURCE=$source"
+        echo "DOWN_KBIT=$down"
+        echo "UP_KBIT=$up"
+        echo "MEASURED_AT=$(date +%s)"
+    } > "$STATE_DIR/$key.tmp" && mv "$STATE_DIR/$key.tmp" "$STATE_DIR/$key"
+}
+
+# The rate CAKE gets for one direction, in kbit/s; 0 = leave it alone.
+shape_kbit() {
+    local measured=$1 percent=$2 link_mbit=$3
+    (( measured > 0 )) || { echo 0; return; }
+    if (( link_mbit > 0 && measured >= link_mbit * 1000 * 85 / 100 )); then
+        echo 0; return
+    fi
+    if (( measured > MAX_SHAPE_MBIT * 1000 )); then
+        echo 0; return
+    fi
+    echo $(( measured * percent / 100 ))
+}
+
+fmt_mbit() {
+    awk -v k="$1" 'BEGIN { if (k >= 10000) printf "%.0f Mbit/s", k / 1000; else printf "%.1f Mbit/s", k / 1000 }'
+}
+
+# -- tc -------------------------------------------------------------------------
+
+ifb_names() {
+    local idx
+    idx=$(cat "$SYS/$1/ifindex" 2>/dev/null) || idx=0
+    IFB_DL="niixqdl$idx"
+    IFB_UL="niixqul$idx"
+}
+
+teardown_dev() {
+    local dev=$1
+    [ -n "$dev" ] || return 0
+    tc qdisc del dev "$dev" clsact 2>/dev/null || true
+    ifb_names "$dev"
+    ip link del "$IFB_DL" 2>/dev/null || true
+    ip link del "$IFB_UL" 2>/dev/null || true
+}
+
+teardown_all() {
+    local d prev=""
+    [ -r "$RUN_STATE" ] && prev=$(sed -n 's/^DEV=//p' "$RUN_STATE")
+    teardown_dev "$prev"
+    for d in "$SYS"/niixq*; do
+        [ -e "$d" ] && ip link del "${d##*/}" 2>/dev/null
+    done
+    rm -f "$RUN_STATE"
+}
+
+# Filters on DEV's clsact hook (ingress or egress): local traffic passes,
+# everything else over IPv4/IPv6 goes to the shaping device.
+add_redirect() {
+    local dev=$1 hook=$2 field=$3 ifb=$4 net pref=10
+    shift 4
+    for net in "${LOCAL_V4[@]}" "$@"; do
+        [[ "$net" == *:* ]] && continue
+        tc filter add dev "$dev" "$hook" protocol ip pref "$pref" flower "$field" "$net" action ok || return 1
+        pref=$(( pref + 1 ))
+    done
+    for net in "${LOCAL_V6[@]}" "$@"; do
+        [[ "$net" == *:* ]] || continue
+        tc filter add dev "$dev" "$hook" protocol ipv6 pref "$pref" flower "$field" "$net" action ok || return 1
+        pref=$(( pref + 1 ))
+    done
+    tc filter add dev "$dev" "$hook" protocol ip pref 900 matchall \
+        action mirred egress redirect dev "$ifb" || return 1
+    tc filter add dev "$dev" "$hook" protocol ipv6 pref 901 matchall \
+        action mirred egress redirect dev "$ifb" || return 1
+}
+
+# Networks on the same link as this PC (its own subnet, also a public IPv6
+# /64 the LAN devices share).
+onlink_nets() {
+    { ip -4 route show dev "$1" scope link 2>/dev/null; ip -6 route show dev "$1" 2>/dev/null; } \
+        | awk '$1 != "default" && $1 ~ /\// && $0 !~ / via / { print $1 }' | sort -u
+}
+
+setup_dev() {
+    local dev=$1 down=$2 up=$3
+    local -a nets
+    mapfile -t nets < <(onlink_nets "$dev")
+    ifb_names "$dev"
+    tc qdisc add dev "$dev" clsact || return 1
+    if (( up > 0 )); then
+        ip link add name "$IFB_UL" type ifb && ip link set dev "$IFB_UL" up || return 1
+        # nat: fair per device behind this PC too (the Wi-Fi hotspot).
+        # shellcheck disable=SC2086
+        tc qdisc replace dev "$IFB_UL" root cake bandwidth "${up}kbit" besteffort \
+            dual-srchost nat $CAKE_OVERHEAD || return 1
+        add_redirect "$dev" egress dst_ip "$IFB_UL" "${nets[@]}" || return 1
+    fi
+    if (( down > 0 )); then
+        ip link add name "$IFB_DL" type ifb && ip link set dev "$IFB_DL" up || return 1
+        # shellcheck disable=SC2086
+        tc qdisc replace dev "$IFB_DL" root cake bandwidth "${down}kbit" besteffort \
+            dual-dsthost nat wash ingress $CAKE_OVERHEAD || return 1
+        add_redirect "$dev" ingress src_ip "$IFB_DL" "${nets[@]}" || return 1
+    fi
+}
+
+# -- apply ------------------------------------------------------------------------
+
+game_running() {
+    pgrep -x reaper >/dev/null 2>&1 && return 0
+    local p
+    for p in wineserver gamescope retroarch; do
+        pgrep -x "$p" >/dev/null 2>&1 && return 0
+    done
+    return 1
+}
+
+cmd_apply() {
+    mkdir -p "$RUN_DIR"
+    exec 9>"$LOCK"
+    flock -w 60 9 || { warn "another niix-qos is still running"; return 1; }
+
+    local reason dev gw key name link down up want have=""
+    reason=$(disabled_reason)
+    if [ -n "$reason" ]; then
+        teardown_all; say "off: $reason"; return 0
+    fi
+    read -r dev gw < <(find_uplink) || true
+    if [ -z "${dev:-}" ]; then
+        teardown_all; say "no internet connection - nothing to shape"; return 0
+    fi
+    key=$(network_key "$dev" "$gw")
+    name=$(network_name "$dev")
+    link=$(link_speed "$dev")
+
+    down=0; up=0
+    if load_network "$key"; then
+        if [ "$SOURCE" != off ]; then
+            down=$(shape_kbit "$DOWN_KBIT" "$DOWN_PERCENT" "$link")
+            up=$(shape_kbit "$UP_KBIT" "$UP_PERCENT" "$link")
+        fi
+        if [ "$SOURCE" = auto ] && (( $(date +%s) - MEASURED_AT > REMEASURE_DAYS * 86400 )) \
+                && ! is_live && ! is_metered "$dev"; then
+            say "$name: measured over $REMEASURE_DAYS days ago - measuring again when idle"
+            systemctl --no-block start niix-qos-measure.service 2>/dev/null || true
+        fi
+    elif is_live; then
+        say "$name: not measured (live session - run 'niix-qos measure' to try it)"
+    elif is_metered "$dev"; then
+        say "$name: metered connection - not measured (set speeds with 'niix-qos set DOWN UP')"
+    else
+        say "$name: new network - measuring its speed when the line is idle"
+        systemctl --no-block start niix-qos-measure.service 2>/dev/null || true
+    fi
+
+    # Nothing changed (DHCP renewal...): leave the queues alone.
+    want="DEV=$dev KEY=$key DOWN=$down UP=$up NETS=$(onlink_nets "$dev" | tr '\n' ',')"
+    [ -r "$RUN_STATE" ] && have=$(sed -n 's/^WANT=//p' "$RUN_STATE")
+    ifb_names "$dev"
+    if [ "$want" = "$have" ] && { (( down == 0 )) || [ -e "$SYS/$IFB_DL" ]; } \
+            && { (( up == 0 )) || [ -e "$SYS/$IFB_UL" ]; }; then
+        return 0
+    fi
+
+    teardown_all
+    if (( down == 0 && up == 0 )); then
+        say "$name ($dev): not shaped"
+        return 0
+    fi
+    if ! setup_dev "$dev" "$down" "$up"; then
+        warn "$name ($dev): could not set up CAKE - this kernel may lack sch_cake/ifb/act_mirred/cls_flower"
+        teardown_all
+        return 1
+    fi
+    printf 'DEV=%s\nWANT=%s\n' "$dev" "$want" > "$RUN_STATE"
+    say "$name ($dev): CAKE at $( (( down > 0 )) && fmt_mbit "$down" || echo unshaped) down, $( (( up > 0 )) && fmt_mbit "$up" || echo unshaped) up"
+}
+
+# -- Load generator and measurement ---------------------------------------------
+
+LOAD_PIDS=()
+UPLOAD_FILE=""
+
+stop_load() {
+    local p
+    for p in "${LOAD_PIDS[@]}"; do
+        kill "$p" 2>/dev/null
+    done
+    for p in "${LOAD_PIDS[@]}"; do
+        wait "$p" 2>/dev/null
+    done
+    LOAD_PIDS=()
+    [ -n "$UPLOAD_FILE" ] && rm -f "$UPLOAD_FILE"
+    UPLOAD_FILE=""
+}
+MEASURING=false
+trap 'stop_load' EXIT
+# Interrupted mid-measurement: put the shaping back before leaving.
+trap 'stop_load; $MEASURING && { MEASURING=false; cmd_apply >/dev/null; }; exit 130' INT TERM
+
+# One stream: a curl in the background, killed with its loop (a plain kill
+# of the loop's subshell would leave a running curl behind).
+stream() {
+    local cpid=""
+    trap '[ -n "$cpid" ] && { kill "$cpid" 2>/dev/null; wait "$cpid" 2>/dev/null; }; exit 0' TERM INT HUP
+    while :; do
+        curl -sf --connect-timeout 5 "$@" &
+        cpid=$!
+        wait "$cpid" || sleep 1
+    done
+}
+
+# 6 parallel streams, like the big speed test sites: one TCP stream can't
+# fill a fast or long line on its own.
+start_load() {
+    local dir=$1 i j
+    local -a args
+    if [ "$dir" = down ]; then
+        args=()
+        for (( j = 0; j < 30; j++ )); do args+=(-o /dev/null "$DOWN_URL"); done
+        for (( i = 0; i < 6; i++ )); do
+            stream "${args[@]}" &
+            LOAD_PIDS+=($!)
+        done
+    else
+        UPLOAD_FILE=$(mktemp -p /dev/shm niix-qos.XXXXXX 2>/dev/null || mktemp)
+        head -c 25000000 /dev/urandom > "$UPLOAD_FILE"
+        for (( i = 0; i < 6; i++ )); do
+            stream -o /dev/null -X POST -H 'Content-Type: application/octet-stream' \
+                -T "$UPLOAD_FILE" "$UP_URL" &
+            LOAD_PIDS+=($!)
+        done
+    fi
+}
+
+counter() { cat "$SYS/$1/statistics/$2" 2>/dev/null || echo 0; }
+
+# kbit/s on DEV over SECS seconds, in one direction (rx_bytes/tx_bytes).
+rate_over() {
+    local dev=$1 stat=$2 secs=$3 a b
+    a=$(counter "$dev" "$stat"); sleep "$secs"; b=$(counter "$dev" "$stat")
+    echo $(( (b - a) * 8 / 1000 / secs ))
+}
+
+# Fills one direction and reads the card's own byte counter once a second -
+# real traffic on the wire, not what curl hands to the kernel. The first 3 s
+# (TCP ramping up) are skipped; it stops when 3 seconds in a row agree within
+# 10 %, or after 15 s. Prints kbit/s (0 = failed).
+measure_dir() {
+    local dev=$1 dir=$2 stat a b t rate=0
+    local -a samples=()
+    [ "$dir" = down ] && stat=rx_bytes || stat=tx_bytes
+    start_load "$dir"
+    sleep 3
+    a=$(counter "$dev" "$stat")
+    for (( t = 0; t < 12; t++ )); do
+        sleep 1
+        b=$(counter "$dev" "$stat")
+        samples+=($(( (b - a) * 8 / 1000 )))
+        a=$b
+        if (( ${#samples[@]} >= 3 )); then
+            rate=$(printf '%s\n' "${samples[@]: -3}" | awk '
+                { s[NR] = $1; sum += $1; if (NR == 1 || $1 < lo) lo = $1; if ($1 > hi) hi = $1 }
+                END { avg = sum / NR; if (avg > 0 && (hi - lo) <= avg * 0.10) printf "%d", avg; else print 0 }')
+            (( rate > 0 )) && break
+        fi
+    done
+    stop_load
+    if (( rate == 0 )) && (( ${#samples[@]} >= 3 )); then
+        # Never settled: the median of the last 5 seconds.
+        rate=$(printf '%s\n' "${samples[@]: -5}" | sort -n | awk '{ v[NR] = $1 } END { print v[int((NR + 1) / 2)] + 0 }')
+    fi
+    echo "${rate:-0}"
+}
+
+# Median ping in ms to PING_HOST over SECS seconds ("-" when it doesn't answer).
+median_ping() {
+    ping -n -i 0.2 -w "$1" "$PING_HOST" 2>/dev/null \
+        | sed -n 's/.*time=\([0-9.]*\) ms.*/\1/p' | sort -n \
+        | awk '{ v[NR] = $1 } END { if (NR) printf "%.0f", v[int((NR + 1) / 2)]; else print "-" }'
+}
+
+# Loaded latency: ping while one direction is full.
+loaded_ping() {
+    local res
+    start_load "$1"
+    sleep 2
+    res=$(median_ping 6)
+    stop_load
+    echo "$res"
+}
+
+wait_until_idle() {
+    local dev=$1 tries=0 rx tx
+    while :; do
+        if ! game_running; then
+            rx=$(rate_over "$dev" rx_bytes 3)
+            tx=$(rate_over "$dev" tx_bytes 3)
+            (( rx < 2000 && tx < 2000 )) && return 0
+        fi
+        tries=$(( tries + 1 ))
+        (( tries >= 60 )) && return 1     # ~30 minutes
+        sleep 27
+    done
+}
+
+wait_until_online() {
+    local i
+    for (( i = 0; i < 60; i++ )); do
+        [ "$(nmcli -t networking connectivity 2>/dev/null)" = full ] && return 0
+        sleep 5
+    done
+    return 1
+}
+
+cmd_measure() {
+    local auto=false dev gw key name down up idle_ping
+    [ "${1:-}" = --auto ] && auto=true
+    command -v curl >/dev/null || { warn "curl is missing"; return 1; }
+
+    if $auto; then
+        [ -n "$(disabled_reason)" ] && return 0
+        wait_until_online || { say "not online - measuring next time"; return 0; }
+    fi
+    read -r dev gw < <(find_uplink) || true
+    [ -n "${dev:-}" ] || { warn "no internet connection"; return 1; }
+    key=$(network_key "$dev" "$gw")
+    name=$(network_name "$dev")
+
+    if $auto; then
+        if load_network "$key"; then
+            [ "$SOURCE" != auto ] && return 0
+            (( $(date +%s) - MEASURED_AT < REMEASURE_DAYS * 86400 )) && return 0
+        fi
+        is_metered "$dev" && return 0
+        if ! wait_until_idle "$dev"; then
+            say "$name: the line was never idle - measuring next time"
+            return 0
+        fi
+    fi
+
+    say "$name ($dev): measuring - about 30 seconds"
+    # The real line, not the shaped one - and no connection change may put
+    # the shaping back while it measures (cmd_apply takes the lock again).
+    mkdir -p "$RUN_DIR"
+    exec 9>"$LOCK"
+    flock -w 60 9 || { warn "another niix-qos is still running"; return 1; }
+    MEASURING=true
+    teardown_all
+    idle_ping=$(median_ping 3)
+    down=$(measure_dir "$dev" down)
+    up=$(measure_dir "$dev" up)
+    MEASURING=false
+    say "  download $(fmt_mbit "$down"), upload $(fmt_mbit "$up"), idle ping ${idle_ping} ms"
+
+    if (( down < 500 || up < 100 )); then
+        warn "$name: the measurement failed (download $(fmt_mbit "$down"), upload $(fmt_mbit "$up")) - nothing saved"
+        cmd_apply >/dev/null
+        return 1
+    fi
+    # The network may have changed while it measured.
+    local dev2 gw2
+    read -r dev2 gw2 < <(find_uplink) || true
+    if [ "${dev2:-}" != "$dev" ] || [ "$(network_key "$dev2" "$gw2")" != "$key" ]; then
+        warn "the connection changed while measuring - nothing saved"
+        cmd_apply >/dev/null
+        return 1
+    fi
+    save_network "$key" "$name" "$down" "$up" auto
+    cmd_apply
+}
+
+# -- User commands --------------------------------------------------------------
+
+current() {
+    read -r CUR_DEV CUR_GW < <(find_uplink) || true
+    [ -n "${CUR_DEV:-}" ] || { warn "no internet connection"; exit 1; }
+    CUR_KEY=$(network_key "$CUR_DEV" "$CUR_GW")
+    CUR_NAME=$(network_name "$CUR_DEV")
+}
+
+cmd_status() {
+    local reason link down up shaped=false
+    reason=$(disabled_reason)
+    [ -n "$reason" ] && say "niix-qos: $reason"
+    current
+    link=$(link_speed "$CUR_DEV")
+    say "Connection:  $CUR_NAME ($CUR_DEV$( (( link > 0 )) && echo ", link $link Mbit/s")$(is_metered "$CUR_DEV" && echo ", metered"))"
+    if load_network "$CUR_KEY"; then
+        case "$SOURCE" in
+            off)    say "Setting:     off for this network (niix-qos auto measures it again)" ;;
+            manual) say "Setting:     set by hand: $(fmt_mbit "$DOWN_KBIT") down, $(fmt_mbit "$UP_KBIT") up" ;;
+            *)      say "Measured:    $(fmt_mbit "$DOWN_KBIT") down, $(fmt_mbit "$UP_KBIT") up on $(date -d "@$MEASURED_AT" '+%Y-%m-%d')" ;;
+        esac
+        if [ "$SOURCE" != off ]; then
+            down=$(shape_kbit "$DOWN_KBIT" "$DOWN_PERCENT" "$link")
+            up=$(shape_kbit "$UP_KBIT" "$UP_PERCENT" "$link")
+        fi
+    else
+        say "Measured:    not yet$(is_metered "$CUR_DEV" && echo " (metered - set it with: niix-qos set DOWN UP)")"
+    fi
+    ifb_names "$CUR_DEV"
+    if [ -e "$SYS/$IFB_DL" ] || [ -e "$SYS/$IFB_UL" ]; then
+        shaped=true
+        say "Shaping:     $( [ -e "$SYS/$IFB_DL" ] && fmt_mbit "${down:-0}" || echo off) down, $( [ -e "$SYS/$IFB_UL" ] && fmt_mbit "${up:-0}" || echo off) up (local network unshaped)"
+    else
+        say "Shaping:     none"
+    fi
+    if $shaped; then
+        local ifb
+        for ifb in "$IFB_DL" "$IFB_UL"; do
+            [ -e "$SYS/$ifb" ] || continue
+            tc -s qdisc show dev "$ifb" 2>/dev/null | awk -v n="$( [ "$ifb" = "$IFB_DL" ] && echo download || echo upload)" '
+                /Sent/ { sent = $2; for (i = 1; i < NF; i++) if ($i == "(dropped") drop = $(i + 1) }
+                /pk_delay/ { delay = $2 }
+                END { gsub(",", "", drop); if (delay == "") delay = "-"; printf "  %-9s %s bytes sent, %s dropped, queue delay %s\n", n ":", sent, drop, delay }'
+        done
+    fi
+}
+
+cmd_test() {
+    local idle dl ul
+    current
+    command -v curl >/dev/null || { warn "curl is missing"; return 1; }
+    say "Testing $CUR_NAME ($CUR_DEV) with the current setup - about 25 seconds..."
+    idle=$(median_ping 4)
+    dl=$(loaded_ping down)
+    ul=$(loaded_ping up)
+    say "  ping idle:            ${idle} ms"
+    say "  ping while download:  ${dl} ms"
+    say "  ping while upload:    ${ul} ms"
+    if [[ "$idle" =~ ^[0-9]+$ && "$dl" =~ ^[0-9]+$ && "$ul" =~ ^[0-9]+$ ]]; then
+        local worst=$(( dl > ul ? dl - idle : ul - idle ))
+        if (( worst <= 30 )); then say "  -> good: load adds at most ${worst} ms"
+        elif (( worst <= 100 )); then say "  -> fair: load adds up to ${worst} ms"
+        else say "  -> bufferbloat: load adds up to ${worst} ms$( [ -r "$RUN_STATE" ] || echo " (not shaped right now - try: niix-qos measure)")"
+        fi
+    fi
+}
+
+mbit_to_kbit() {
+    awk -v m="$1" 'BEGIN { if (m !~ /^[0-9]+(\.[0-9]+)?$/) exit 1; printf "%d", m * 1000 }'
+}
+
+cmd_set() {
+    local d u
+    if ! d=$(mbit_to_kbit "${1:-}") || ! u=$(mbit_to_kbit "${2:-}"); then
+        warn "usage: niix-qos set DOWN UP   (Mbit/s, e.g. niix-qos set 250 40)"; exit 1
+    fi
+    current
+    save_network "$CUR_KEY" "$CUR_NAME" "$d" "$u" manual
+    say "$CUR_NAME: $(fmt_mbit "$d") down, $(fmt_mbit "$u") up (shaped at $DOWN_PERCENT % / $UP_PERCENT %)"
+    cmd_apply
+}
+
+cmd_off() {
+    current
+    save_network "$CUR_KEY" "$CUR_NAME" 0 0 off
+    cmd_apply
+}
+
+cmd_auto() {
+    current
+    rm -f "$STATE_DIR/$CUR_KEY"
+    cmd_measure
+}
+
+set_mode() {
+    mkdir -p "${CONF%/*}"
+    if [ -f "$CONF" ] && grep -q '^QOS_MODE=' "$CONF"; then
+        sed -i "s/^QOS_MODE=.*/QOS_MODE=$1/" "$CONF"
+    else
+        echo "QOS_MODE=$1" >> "$CONF"
+    fi
+    QOS_MODE=$1
+    cmd_apply
+}
+
+case "${1:-status}" in
+    status)   cmd_status ;;
+    test)     cmd_test ;;
+    measure)  need_root "$@"; shift; cmd_measure "$@" ;;
+    set)      need_root "$@"; shift; cmd_set "$@" ;;
+    off)      need_root "$@"; cmd_off ;;
+    auto)     need_root "$@"; cmd_auto ;;
+    disable)  need_root "$@"; set_mode off ;;
+    enable)   need_root "$@"; set_mode auto ;;
+    apply)    need_root "$@"; cmd_apply ;;
+    -h|--help|help) usage ;;
+    *)        usage; exit 1 ;;
+esac

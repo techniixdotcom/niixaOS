@@ -1,0 +1,35 @@
+#!/bin/bash
+# update-notify done|failed|broken - tells everyone logged in to the desktop how the
+# automatic update went: after a new kernel a restart is needed (until then
+# newly plugged-in devices may not work), a failed update needs a look or
+# the system silently stops getting updates, and boot files that could not
+# be written must be fixed before the next restart.
+set -uo pipefail
+
+case "${1:-}" in
+    done)
+        [ -d "/usr/lib/modules/$(uname -r)" ] && exit 0
+        title="Restart to finish the update"
+        body="NiiX installed a new kernel. Restart soon - until then, devices you plug in may not work."
+        urgency=normal ;;
+    broken)
+        title="Do not restart - the update needs a fix first"
+        body="The new boot files could not be written, so the computer would not start. Open NiiX Update (or run niix-update in a terminal) for what to do."
+        urgency=critical ;;
+    failed)
+        title="The automatic update failed"
+        body="Open NiiX Update (or run niix-update in a terminal) to see why and to finish the update."
+        urgency=critical ;;
+    *)
+        echo "usage: update-notify done|failed|broken" >&2
+        exit 2 ;;
+esac
+
+loginctl list-users --no-legend 2>/dev/null | while read -r uid user _; do
+    if [[ ! "$uid" =~ ^[0-9]+$ ]] || (( uid < 1000 )); then continue; fi
+    [ -S "/run/user/$uid/bus" ] || continue
+    runuser -u "$user" -- env DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/$uid/bus" \
+        notify-send --app-name="NiiX Update" --icon=system-software-update \
+        --urgency="$urgency" "$title" "$body" 2>/dev/null || true
+done
+exit 0

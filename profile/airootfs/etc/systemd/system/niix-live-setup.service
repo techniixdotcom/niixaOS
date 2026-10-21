@@ -1,0 +1,11 @@
+[Unit]
+Description=NiiX live session setup
+Before=display-manager.service systemd-user-sessions.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/lib/niix/live-setup
+
+[Install]
+WantedBy=multi-user.target

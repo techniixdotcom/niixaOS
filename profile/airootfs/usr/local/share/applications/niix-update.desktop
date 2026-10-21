@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=NiiX Update
+Comment=Update system, AUR and Flatpak apps and firmware - after checking Arch news
+Exec=bash -c 'niix-update; echo; read -rp "Press Enter to close..."'
+Icon=software-update-available
+Terminal=true
+Categories=System;Settings;
+Keywords=update;upgrade;pacman;yay;flatpak;firmware;

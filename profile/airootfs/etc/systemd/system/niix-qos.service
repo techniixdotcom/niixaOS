@@ -1,0 +1,10 @@
+[Unit]
+Description=NiiX bufferbloat fix: CAKE on the internet connection
+Documentation=man:tc-cake(8)
+After=NetworkManager.service
+# Started by NetworkManager's dispatcher (80-niix-qos) on connection changes.
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/niix-qos apply
+TimeoutStartSec=90

@@ -1,0 +1,17 @@
+[Unit]
+Description=NiiX: use Windows's Bluetooth pairing keys when a device rejects NiiX's
+After=bluetooth.service
+Wants=bluetooth.service
+
+[Service]
+ExecStart=/usr/local/bin/niix-bt-keysync watch
+Restart=on-failure
+RestartSec=10
+Nice=10
+NoNewPrivileges=yes
+ProtectSystem=full
+ProtectHome=read-only
+PrivateTmp=yes
+
+[Install]
+WantedBy=bluetooth.target

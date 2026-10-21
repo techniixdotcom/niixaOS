@@ -1,0 +1,214 @@
+#!/bin/bash
+# niix-update - update everything on NiiX Arch, in the order that is safe:
+#   1. Arch news   anything new that may need a manual step BEFORE upgrading
+#                  is shown first (the most common way Arch installs break)
+#   2. System      the signing keys, then pacman -Su (snap-pac takes a
+#                  snapshot before and after)
+#   3. AUR         yay - only if the system upgrade succeeded, so the AUR
+#                  never builds against a half-upgraded system
+#   4. Flatpak     apps and runtimes, then unused runtimes are removed
+#   5. Firmware    lists available updates (fwupd/LVFS); installs on request
+#   6. Report      config files to review (.pacnew), whether to reboot
+#
+#   niix-update                interactive (asks before each step's changes)
+#   niix-update --yes          no questions for packages (news is still shown)
+#   niix-update --firmware     also install firmware updates (always confirmed)
+#   niix-update --clean        also remove orphaned packages and old caches
+#   niix-update --no-aur | --no-flatpak
+set -uo pipefail
+
+YES=0; FIRMWARE=0; CLEAN=0; DO_AUR=1; DO_FLATPAK=1
+for arg in "$@"; do
+    case "$arg" in
+        -y|--yes)    YES=1 ;;
+        --firmware)  FIRMWARE=1 ;;
+        --clean)     CLEAN=1 ;;
+        --no-aur)    DO_AUR=0 ;;
+        --no-flatpak) DO_FLATPAK=0 ;;
+        -h|--help)   awk 'NR > 1 && !/^#/ { exit } NR > 1 { sub(/^# ?/, ""); print }' "$0"; exit 0 ;;
+        *)           echo "Unknown option: $arg (see niix-update --help)" >&2; exit 1 ;;
+    esac
+done
+
+G=$'\033[38;5;118m'; P=$'\033[38;5;205m'; Y=$'\033[1;33m'; R=$'\033[0;31m'
+W=$'\033[1;37m'; N=$'\033[0m'
+step() { echo; echo "${P}== $* ${N}"; }
+ok()   { echo "  ${G}[ok]${N} $*"; }
+note() { echo "  ${Y}[!!]${N} $*"; }
+bad()  { echo "  ${R}[xx]${N} $*"; }
+indent() { sed 's/^/     /'; }
+ask()  { # ask "question" default(y|n) -> 0 for yes
+    local q=$1 def=${2:-y} a
+    [ "$YES" = 1 ] && return 0
+    if [ "$def" = y ]; then read -rp "  $q [Y/n] " a; [[ -z "$a" || "$a" =~ ^[Yy] ]]
+    else read -rp "  $q [y/N] " a; [[ "$a" =~ ^[Yy] ]]; fi
+}
+
+# yay refuses to run as root, and per-user Flatpaks belong to the user.
+if [ "$(id -u)" -eq 0 ]; then
+    echo "Run niix-update as your normal user - it uses sudo where needed." >&2
+    exit 1
+fi
+
+STATE="${XDG_STATE_HOME:-$HOME/.local/state}/niix-update"
+mkdir -p "$STATE"
+# (No output capture: pacman, yay and fwupdmgr keep their colours, progress
+# bars and prompts only when they talk to the terminal directly.)
+
+# One run at a time, and never while pacman is busy.
+exec 8>"$STATE/lock"
+flock -n 8 || { bad "niix-update is already running."; exit 1; }
+if [ -e /var/lib/pacman/db.lck ]; then
+    bad "Another package operation is running (/var/lib/pacman/db.lck). Try again when it finishes."
+    exit 1
+fi
+
+sudo -v || { bad "sudo is needed for system updates."; exit 1; }
+FAILED=0
+
+# -- 1. Arch news
+step "Arch Linux news"
+SEEN_FILE="$STATE/news-seen"
+seen=$(cat "$SEEN_FILE" 2>/dev/null || echo 0)
+[[ "$seen" =~ ^[0-9]+$ ]] || seen=0
+feed=$(mktemp); trap 'rm -f "$feed"' EXIT
+if curl -fsSL --max-time 20 --retry 2 -o "$feed" https://archlinux.org/feeds/news/; then
+    if ! news=$(python3 - "$feed" "$seen" <<'PY'
+import sys, time, xml.etree.ElementTree as ET
+from email.utils import parsedate_to_datetime
+path, seen = sys.argv[1], int(sys.argv[2])
+# First run: show the last 30 days, so a recent manual step is not missed.
+floor = seen if seen else int(time.time()) - 30 * 86400
+newest = seen
+for item in ET.parse(path).getroot().iter("item"):
+    try:
+        ts = int(parsedate_to_datetime(item.findtext("pubDate", "")).timestamp())
+    except Exception:
+        continue
+    newest = max(newest, ts)
+    if ts > floor:
+        print("ITEM\t%s\t%s\t%s" % (time.strftime("%Y-%m-%d", time.localtime(ts)),
+              (item.findtext("title") or "").strip(), (item.findtext("link") or "").strip()))
+print("NEWEST\t%d" % newest)
+PY
+)
+    then
+        news=""
+    fi
+    if [ -z "$news" ]; then
+        note "Could not read the news feed - check https://archlinux.org/news/ yourself."
+        ask "Continue with the update?" n || exit 1
+    else
+        newest=$(printf '%s\n' "$news" | awk -F'\t' '$1=="NEWEST"{print $2}')
+        if printf '%s\n' "$news" | grep -q '^ITEM'; then
+            note "New Arch news since your last update - read before upgrading:"
+            printf '%s\n' "$news" | awk -F'\t' '$1=="ITEM"{printf "     %s  %s\n                 %s\n", $2, $3, $4}'
+            echo
+            if [ "$YES" = 1 ]; then
+                note "--yes given: continuing. If an item above needs a manual step, do it now."
+            else
+                ask "Read them? Continue with the update?" n || { echo "  Stopped - nothing was changed."; exit 0; }
+            fi
+        else
+            ok "Nothing new"
+        fi
+        [ -n "$newest" ] && echo "$newest" > "$SEEN_FILE"
+    fi
+else
+    note "Arch news unreachable - check https://archlinux.org/news/ before upgrading."
+    ask "Continue anyway?" n || exit 1
+fi
+
+# -- 2. System packages
+step "System packages (pacman)"
+confirm=(); [ "$YES" = 1 ] && confirm=(--noconfirm)
+SYSTEM_OK=0
+inhibit() {
+    sudo systemd-inhibit --what=shutdown:sleep --who="niix-update" --why="Installing system updates" \
+        --mode=block "$@"
+}
+# The signing keys first: after a few weeks without updates, packages signed
+# by new keys are otherwise refused. No shutdown or suspend from the desktop
+# halfway through (a half-installed kernel does not boot).
+if inhibit pacman -Sy --needed "${confirm[@]}" archlinux-keyring cachyos-keyring \
+        && inhibit pacman -Su "${confirm[@]}"; then
+    SYSTEM_OK=1; ok "System up to date (snapshots taken by snap-pac)"
+else
+    FAILED=1; bad "System upgrade failed - fix the message above, then run niix-update again."
+fi
+
+# -- 3. AUR
+if [ "$DO_AUR" = 1 ]; then
+    step "AUR packages (yay)"
+    if ! command -v yay >/dev/null 2>&1; then
+        note "yay is not installed - skipped"
+    elif [ "$SYSTEM_OK" != 1 ]; then
+        note "Skipped: building AUR packages on a half-upgraded system can break them."
+    else
+        yay_args=(-Sua); [ "$YES" = 1 ] && yay_args+=(--noconfirm --answerdiff None --answerclean None --answeredit None)
+        if yay "${yay_args[@]}"; then ok "AUR packages up to date"; else FAILED=1; bad "AUR update failed (see above)"; fi
+    fi
+fi
+
+# -- 4. Flatpak
+if [ "$DO_FLATPAK" = 1 ] && command -v flatpak >/dev/null 2>&1; then
+    step "Flatpak apps"
+    if sudo flatpak update --system -y --noninteractive; then ok "System Flatpaks up to date"
+    else FAILED=1; bad "Flatpak update failed (see above)"; fi
+    if flatpak list --user --columns=application 2>/dev/null | grep -q .; then
+        flatpak update --user -y --noninteractive || { FAILED=1; bad "User Flatpak update failed"; }
+    fi
+    sudo flatpak uninstall --system --unused -y --noninteractive >/dev/null 2>&1 \
+        && ok "Unused runtimes removed"
+fi
+
+# -- 5. Firmware
+if command -v fwupdmgr >/dev/null 2>&1; then
+    step "Firmware (fwupd / LVFS)"
+    sudo fwupdmgr refresh --force >/dev/null 2>&1 || true
+    fw=$(fwupdmgr get-updates --no-unreported-check --no-metadata-check 2>&1); fw_rc=$?
+    if [ "$fw_rc" -eq 0 ]; then
+        printf '%s\n' "$fw" | indent
+        # Firmware is never applied silently: it can reboot into a flasher.
+        if [ "$FIRMWARE" = 1 ] || { [ "$YES" != 1 ] && ask "Install these firmware updates now?" n; }; then
+            sudo fwupdmgr update || { FAILED=1; bad "Firmware update failed (see above)"; }
+        else
+            note "Firmware updates available - install with: niix-update --firmware (or GNOME Software)"
+        fi
+    else
+        ok "No firmware updates"
+    fi
+fi
+
+# -- Optional clean-up
+if [ "$CLEAN" = 1 ]; then
+    step "Clean-up"
+    orphans=$(pacman -Qdtq 2>/dev/null)
+    if [ -n "$orphans" ]; then
+        printf '%s\n' "$orphans" | indent
+        if ask "Remove these unused packages?" y; then
+            # shellcheck disable=SC2086
+            sudo pacman -Rns --noconfirm $orphans && ok "Orphans removed"
+        fi
+    else
+        ok "No orphaned packages"
+    fi
+    if command -v paccache >/dev/null 2>&1; then
+        sudo paccache -rk2 >/dev/null && sudo paccache -ruk0 >/dev/null && ok "Package cache trimmed (last 2 versions kept)"
+    fi
+fi
+
+# -- 6. Report
+step "Summary"
+if command -v pacdiff >/dev/null 2>&1; then
+    pn=$(pacdiff -o 2>/dev/null)
+    if [ -n "$pn" ]; then
+        note "Config files with a new default version to review (sudo DIFFPROG=meld pacdiff, or merge by hand):"
+        printf '%s\n' "$pn" | indent
+    fi
+fi
+if [ ! -d "/usr/lib/modules/$(uname -r)" ]; then
+    note "The running kernel was updated - ${W}reboot${N} to use it (and before plugging in new hardware)."
+fi
+if [ "$FAILED" = 0 ]; then ok "Everything is up to date."; else bad "Finished with errors - see above."; fi
+exit "$FAILED"

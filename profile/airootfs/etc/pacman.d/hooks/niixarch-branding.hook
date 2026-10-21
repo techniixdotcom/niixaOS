@@ -1,0 +1,10 @@
+[Trigger]
+Operation = Install
+Operation = Upgrade
+Type = Package
+Target = filesystem
+
+[Action]
+Description = Re-applying NiiX Arch branding...
+When = PostTransaction
+Exec = /usr/local/lib/niix-branding

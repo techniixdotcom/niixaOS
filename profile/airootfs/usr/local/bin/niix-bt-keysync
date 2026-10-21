@@ -1,0 +1,194 @@
+#!/bin/bash
+# niix-bt-keysync - Bluetooth devices keep working in both NiiX and Windows.
+#
+# Windows and NiiX share this PC's Bluetooth address, so a device paired in
+# one of them rejects the pairing key of the other. When a device rejects
+# NiiX's key and Windows holds a different one for it, this takes Windows's
+# key and reconnects the device. A device that accepts NiiX's key is never
+# touched, so whichever system paired last wins and neither needs re-pairing.
+#
+#   niix-bt-keysync watch          the service: react to rejected keys
+#   niix-bt-keysync sync ADDRESS   take Windows's key for one device now
+#
+# Covers classic Bluetooth (headsets, speakers, most controllers and older
+# mice and keyboards) for every adapter and every Windows install on the PC.
+# Keys are never printed or logged. Log: journalctl -u niix-bt-keysync
+set -uo pipefail
+umask 077
+
+BLUEZ=/var/lib/bluetooth
+RUN=/run/niix-bt-keysync
+WIN=$RUN/win
+HIVE=Windows/System32/config/SYSTEM
+
+say() { printf 'niix-bt-keysync: %s\n' "$*"; }
+
+[ "$(id -u)" -eq 0 ] || { echo "niix-bt-keysync must run as root" >&2; exit 1; }
+command -v reged >/dev/null 2>&1 || { say "reged (package chntpw) is missing - nothing to do"; exit 0; }
+
+cleanup() {
+    if mountpoint -q "$WIN"; then umount "$WIN"; fi
+    rm -f "$RUN"/*.reg
+}
+
+# reged_value HIVE KEY VALUE : the data of one value of KEY, as .reg text.
+# The export also holds KEY's subkeys, so only its own section is read.
+reged_value() {
+    local out=$RUN/$BASHPID.reg
+    reged -x "$1" 'HKEY_LOCAL_MACHINE\SYSTEM' "$2" "$out" >/dev/null 2>&1
+    [ -f "$out" ] || return 1
+    awk -v name="\"$3\"=" '
+        { sub(/\r$/, "") }
+        /^\[/ { if (seen++) exit; next }
+        found { v = v $0; if (!sub(/\\$/, "", v)) { print v; exit }; next }
+        tolower(substr($0, 1, length(name))) == tolower(name) {
+            v = substr($0, length(name) + 1); found = 1
+            if (!sub(/\\$/, "", v)) { print v; exit } }' "$out"
+    rm -f "$out"
+}
+
+# hive_key HIVE ADAPTER DEVICE : the link key HIVE holds for DEVICE, the way
+# BlueZ writes it (32 upper-case hex digits), or nothing.
+hive_key() {
+    local value set=001 adapter=${2//:/} device=${3//:/}
+    # The control set Windows boots with (Select\Current), usually 001.
+    value=$(reged_value "$1" 'Select' 'Current')
+    value=${value#dword:}
+    if [[ "$value" =~ ^[0-9a-fA-F]{8}$ ]] && (( 16#$value > 0 && 16#$value < 1000 )); then
+        set=$(printf '%03d' $(( 16#$value )))
+    fi
+    value=$(reged_value "$1" "ControlSet$set\\Services\\BTHPORT\\Parameters\\Keys\\${adapter,,}" "${device,,}")
+    value=${value#hex:}; value=${value//,/}; value=${value// /}
+    [[ "$value" =~ ^[0-9a-fA-F]{32}$ ]] || return 1
+    printf '%s\n' "${value^^}"
+}
+
+# A hive whose two sequence numbers differ has changes Windows has not
+# written into it yet (they are in its log files until a full shutdown).
+hive_dirty() {
+    local first second
+    first=$(od -An -tu4 -j4 -N4 "$1" 2>/dev/null)
+    second=$(od -An -tu4 -j8 -N4 "$1" 2>/dev/null)
+    [ "$first" != "$second" ]
+}
+
+# windows_key ADAPTER DEVICE : sets WINDOWS_KEY to Windows's key for DEVICE
+# from the first Windows install that has one - mounted ones first, then each
+# unmounted NTFS volume read-only at $WIN. WINDOWS_SEEN and WINDOWS_DIRTY say
+# why there is none.
+windows_key() {
+    local dir dev key
+    WINDOWS_KEY="" WINDOWS_SEEN=false WINDOWS_DIRTY=false
+    while read -r dir; do
+        dir=$(printf '%b' "$dir")              # findmnt -r writes spaces as \x20
+        [ -f "$dir/$HIVE" ] || continue
+        WINDOWS_SEEN=true
+        hive_dirty "$dir/$HIVE" && WINDOWS_DIRTY=true
+        key=$(hive_key "$dir/$HIVE" "$1" "$2") && { WINDOWS_KEY=$key; return 0; }
+    done < <(findmnt -rn -o TARGET -t ntfs3,ntfs,fuseblk 2>/dev/null)
+    mkdir -p "$WIN"
+    while read -r dev; do
+        findmnt -rn -S "$dev" >/dev/null 2>&1 && continue
+        mount -t ntfs3 -o ro "$dev" "$WIN" 2>/dev/null \
+            || mount -t ntfs-3g -o ro "$dev" "$WIN" 2>/dev/null || continue
+        key=""
+        if [ -f "$WIN/$HIVE" ]; then
+            WINDOWS_SEEN=true
+            hive_dirty "$WIN/$HIVE" && WINDOWS_DIRTY=true
+            key=$(hive_key "$WIN/$HIVE" "$1" "$2")
+        fi
+        umount "$WIN"
+        [ -n "$key" ] && { WINDOWS_KEY=$key; return 0; }
+    done < <(blkid -t TYPE=ntfs -o device 2>/dev/null)
+    return 1
+}
+
+# sync_device ADDRESS : 0 when the device was switched to Windows's key.
+sync_device() {
+    local device=${1^^} dir adapter info current name i
+    [[ "$device" =~ ^([0-9A-F]{2}:){5}[0-9A-F]{2}$ ]] || { say "not a Bluetooth address: $1"; return 1; }
+    for dir in "$BLUEZ"/*/; do
+        adapter=$(basename "$dir")
+        info="$BLUEZ/$adapter/$device/info"
+        [ -f "$info" ] || continue
+        name=$(sed -n 's/^Name=//p' "$info" | head -n 1)
+        name=${name:-$device}
+        current=$(sed -n '/^\[LinkKey\]/,/^\[/s/^Key=//p' "$info")
+        [ -n "$current" ] || { say "$name has no classic pairing key in NiiX - left alone"; return 1; }
+        if ! windows_key "$adapter" "$device"; then
+            if ! $WINDOWS_SEEN; then
+                say "$name: no readable Windows was found (none, or it is encrypted with BitLocker) - if it does not connect, pair it again in Settings"
+            elif $WINDOWS_DIRTY; then
+                say "$name: Windows has not saved its key to disk yet - shut Windows down fully (or turn off its Fast Startup) and start NiiX again, or pair it again in Settings"
+            else
+                say "$name: Windows has no key for it - if it does not connect, pair it again in Settings"
+            fi
+            return 1
+        fi
+        if [ "$WINDOWS_KEY" = "$current" ]; then
+            say "$name: NiiX already uses the key Windows has - if it does not connect, pair it again in Settings"
+            return 1
+        fi
+        # bluetoothd writes its copy back when it stops, so it is stopped
+        # first. Only the key changes; type and PIN length stay as they are.
+        systemctl stop bluetooth.service
+        sed -i "/^\[LinkKey\]/,/^\[/s/^Key=.*/Key=$WINDOWS_KEY/" "$info"
+        systemctl start bluetooth.service
+        say "$name: now uses the pairing key from Windows"
+        for (( i = 0; i < 20; i++ )); do
+            bluetoothctl show "$adapter" 2>/dev/null | grep -q 'Powered: yes' && break
+            sleep 0.5
+        done
+        bluetoothctl connect "$device" >/dev/null 2>&1 || true
+        return 0
+    done
+    say "$device is not paired in NiiX"
+    return 1
+}
+
+# btmon reports a rejected key as
+#   @ MGMT Event: Authentication Failed (0x0011) plen 8 ...
+#           BR/EDR Address: 44:5E:CD:3E:AE:03 (...)
+#           Status: Authentication Failed (0x05)
+# Other statuses (timeouts, busy, ...) are not about the key and are ignored.
+# grep keeps the rest of btmon's output (every audio packet) away from bash.
+watch() {
+    local line address="" pending=false now
+    local -A handled=()
+    say "watching for Bluetooth devices that reject NiiX's pairing key"
+    while IFS= read -r line; do
+        case "$line" in
+            "@ MGMT Event: Authentication Failed"*)
+                pending=true; address="" ;;
+            *"BR/EDR Address: "*)
+                if $pending && [[ "$line" =~ ([0-9A-F]{2}(:[0-9A-F]{2}){5}) ]]; then
+                    address=${BASH_REMATCH[1]}
+                else
+                    pending=false
+                fi ;;
+            *"Status: Authentication Failed (0x05)"*)
+                if $pending && [ -n "$address" ]; then
+                    # One failure is often reported more than once.
+                    now=$EPOCHSECONDS
+                    if (( now - ${handled[$address]:-0} >= 60 )); then
+                        handled[$address]=$now
+                        sync_device "$address"
+                    fi
+                fi
+                pending=false ;;
+            *)
+                pending=false ;;
+        esac
+    done < <(stdbuf -oL btmon 2>/dev/null | grep --line-buffered -A 2 '^@ MGMT Event: Authentication Failed')
+    say "btmon stopped"
+    return 1
+}
+
+trap cleanup EXIT
+mkdir -p "$RUN" && chmod 700 "$RUN"
+case "${1:-}" in
+    watch) watch ;;
+    sync)  [ $# -ge 2 ] || { echo "usage: niix-bt-keysync sync ADDRESS" >&2; exit 1; }
+           sync_device "$2" ;;
+    *)     echo "usage: niix-bt-keysync {watch|sync ADDRESS}" >&2; exit 1 ;;
+esac

@@ -1,0 +1,6 @@
+[Unit]
+Description=NiiX: tell the desktop that the automatic update failed
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/lib/niix-system/update-notify failed

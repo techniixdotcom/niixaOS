@@ -1,0 +1,516 @@
+#!/usr/bin/env python3
+"""niix-padnav - use a game controller as mouse and keyboard on the desktop.
+
+Runs in the desktop session (systemd user service) and works with anything the
+kernel sees as a gamepad: Xbox, PlayStation, Switch Pro, 8BitDo and most
+others, wired or over Bluetooth.
+
+  left stick          move the pointer       right stick         scroll
+  A / Cross           left click             B / Circle          right click
+  X, Y / Square,      Enter                  d-pad               arrow keys
+    Triangle
+  LB / RB             previous / next item   RT / LT             left / right click
+                      (Shift+Tab / Tab)
+  Start / Options     open the NiiX menu     Back / Share        Escape
+  left stick click    switch window          right stick click   on-screen keyboard
+  Guide / PS / Home   turn the controller mouse off and on
+
+It steps aside by itself:
+  - while a game is running (Steam, Lutris, Heroic, Wine/Proton, emulators)
+  - while Steam is open and signed in - Steam's own desktop layout drives the
+    desktop then, and two of them at once would fight over the pointer
+The controller is never grabbed, so games and browsers always see it.
+
+Log: journalctl --user -u niix-padnav
+"""
+import os
+import re
+import selectors
+import signal
+import subprocess
+import sys
+import time
+
+try:
+    import evdev
+    from evdev import ecodes as e
+except ImportError:
+    print("niix-padnav: python-evdev is missing (sudo pacman -S python-evdev)", file=sys.stderr)
+    sys.exit(0)
+
+POINTER_SPEED = 1400.0   # pixels per second with the stick pushed all the way
+SCROLL_SPEED = 1800.0    # hi-res wheel units per second (120 = one notch)
+DEADZONE = 0.20
+TRIGGER_PRESS = 0.55     # an analog trigger counts as pressed past this point
+TRIGGER_RELEASE = 0.35
+TICK = 1 / 120
+RESCAN_EVERY = 2.0
+CHECK_EVERY = 1.5
+
+STATE_DIR = os.path.join(os.environ.get("XDG_STATE_HOME") or os.path.expanduser("~/.local/state"), "niix")
+OFF_FLAG = os.path.join(STATE_DIR, "padnav-off")
+OWN_PREFIX = "NiiX controller"
+
+# Process names (as in /proc/PID/comm, cut to 15 characters) that mean a game
+# is running. Steam starts every game through "reaper".
+GAME_PROCESSES = {
+    "reaper", "gamescope", "gamescope-wl", "wineserver", "wine64-preloade",
+    "wine-preloader", "retroarch", "dolphin-emu", "pcsx2-qt", "rpcs3",
+    "duckstation-qt", "ppssppsdl", "ppssppqt", "cemu", "ryujinx", "xemu",
+    "melonds", "azahar", "shadps4", "eden", "citron", "mgba-qt", "flycast",
+}
+
+HI_RES_WHEEL = getattr(e, "REL_WHEEL_HI_RES", None)
+HI_RES_HWHEEL = getattr(e, "REL_HWHEEL_HI_RES", None)
+MOUSE_BUTTONS = (e.BTN_LEFT, e.BTN_RIGHT, e.BTN_MIDDLE)
+
+MOUSE, KEYS, TOGGLE, OSK = "mouse", "keys", "toggle", "osk"
+
+BUTTONS = {
+    e.BTN_SOUTH: (MOUSE, (e.BTN_LEFT,)),
+    e.BTN_EAST: (MOUSE, (e.BTN_RIGHT,)),
+    e.BTN_NORTH: (KEYS, (e.KEY_ENTER,)),
+    e.BTN_WEST: (KEYS, (e.KEY_ENTER,)),
+    e.BTN_TL: (KEYS, (e.KEY_LEFTSHIFT, e.KEY_TAB)),
+    e.BTN_TR: (KEYS, (e.KEY_TAB,)),
+    e.BTN_TL2: (MOUSE, (e.BTN_RIGHT,)),
+    e.BTN_TR2: (MOUSE, (e.BTN_LEFT,)),
+    e.BTN_START: (KEYS, (e.KEY_LEFTMETA,)),
+    e.BTN_SELECT: (KEYS, (e.KEY_ESC,)),
+    e.BTN_THUMBL: (KEYS, (e.KEY_LEFTALT, e.KEY_TAB)),
+    e.BTN_THUMBR: (OSK, ()),
+    e.BTN_MODE: (TOGGLE, ()),
+    e.BTN_DPAD_UP: (KEYS, (e.KEY_UP,)),
+    e.BTN_DPAD_DOWN: (KEYS, (e.KEY_DOWN,)),
+    e.BTN_DPAD_LEFT: (KEYS, (e.KEY_LEFT,)),
+    e.BTN_DPAD_RIGHT: (KEYS, (e.KEY_RIGHT,)),
+}
+
+# The d-pad arrives as a hat axis on most pads: (axis, direction) -> button.
+HAT = {
+    (e.ABS_HAT0X, -1): e.BTN_DPAD_LEFT, (e.ABS_HAT0X, 1): e.BTN_DPAD_RIGHT,
+    (e.ABS_HAT0Y, -1): e.BTN_DPAD_UP, (e.ABS_HAT0Y, 1): e.BTN_DPAD_DOWN,
+}
+
+KEYBOARD_KEYS = sorted({k for kind, codes in BUTTONS.values() if kind == KEYS for k in codes})
+
+STICK_LX, STICK_LY, STICK_RX, STICK_RY, TRIGGER_L, TRIGGER_R = range(6)
+
+
+def log(msg):
+    print("niix-padnav: " + msg, flush=True)
+
+
+def notify(title, body):
+    try:
+        subprocess.Popen(["notify-send", "-a", "NiiX", "-t", "2500", title, body],
+                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    except OSError:
+        pass
+
+
+class Pad:
+    def __init__(self, path, dev):
+        self.path = path
+        self.dev = dev
+        caps = dev.capabilities()
+        info = dict(caps.get(e.EV_ABS, []))
+        keys = set(caps.get(e.EV_KEY, []))
+
+        # Most drivers put the right stick on RX/RY and the triggers on Z/RZ.
+        # Generic HID pads without RX use Z/RZ for the right stick instead.
+        roles = {e.ABS_X: STICK_LX, e.ABS_Y: STICK_LY}
+        if e.ABS_RX in info:
+            roles.update({e.ABS_RX: STICK_RX, e.ABS_RY: STICK_RY})
+            # Pads that also report the triggers as buttons: use the buttons,
+            # so one pull isn't counted twice.
+            if not (e.BTN_TL2 in keys and e.BTN_TR2 in keys):
+                roles.update({e.ABS_Z: TRIGGER_L, e.ABS_RZ: TRIGGER_R})
+        else:
+            roles.update({e.ABS_Z: STICK_RX, e.ABS_RZ: STICK_RY})
+
+        self.axes = {}            # event code -> (role, min, max)
+        for code, role in roles.items():
+            if code in info and info[code].max > info[code].min:
+                self.axes[code] = (role, info[code].min, info[code].max)
+        self.values = [0.0] * 6
+        self.trigger_down = {TRIGGER_L: False, TRIGGER_R: False}
+        self.hat = {e.ABS_HAT0X: 0, e.ABS_HAT0Y: 0}
+
+    def set_axis(self, code, raw):
+        role, low, high = self.axes[code]
+        if role in (TRIGGER_L, TRIGGER_R):
+            value = (raw - low) / (high - low)
+            self.values[role] = max(0.0, min(1.0, value))
+        else:
+            value = (raw - (low + high) / 2) / ((high - low) / 2)
+            self.values[role] = max(-1.0, min(1.0, value))
+        return role
+
+    def stick(self, x_role, y_role):
+        x, y = self.values[x_role], self.values[y_role]
+        mag = (x * x + y * y) ** 0.5
+        if mag < DEADZONE:
+            return 0.0, 0.0
+        strength = min(1.0, (mag - DEADZONE) / (1 - DEADZONE)) ** 2
+        return x / mag * strength, y / mag * strength
+
+
+def is_gamepad(dev):
+    if dev.name.startswith(OWN_PREFIX):
+        return False
+    caps = dev.capabilities(absinfo=False)
+    keys = set(caps.get(e.EV_KEY, []))
+    axes = set(caps.get(e.EV_ABS, []))
+    return e.BTN_SOUTH in keys and e.ABS_X in axes and e.ABS_Y in axes
+
+
+def game_running():
+    try:
+        pids = [p for p in os.listdir("/proc") if p.isdigit()]
+    except OSError:
+        return False
+    for pid in pids:
+        try:
+            with open("/proc/%s/comm" % pid) as fh:
+                if fh.read().strip().lower() in GAME_PROCESSES:
+                    return True
+        except OSError:
+            continue
+    return False
+
+
+def steam_signed_in():
+    try:
+        with open(os.path.expanduser("~/.steam/registry.vdf"), errors="ignore") as fh:
+            text = fh.read()
+    except OSError:
+        return False
+    pid = re.search(r'"pid"\s+"(\d+)"', text)
+    user = re.search(r'"ActiveUser"\s+"(\d+)"', text)
+    if not pid or not user or user.group(1) == "0":
+        return False
+    # registry.vdf survives a Steam crash - make sure that pid really is Steam.
+    try:
+        with open("/proc/%s/comm" % pid.group(1)) as fh:
+            return fh.read().strip().startswith("steam")
+    except OSError:
+        return False
+
+
+class Navigator:
+    def __init__(self):
+        self.selector = selectors.DefaultSelector()
+        self.pads = {}            # device path -> Pad
+        self.ignored = set()      # device paths that are not gamepads
+        self.mouse = None
+        self.keyboard = None
+        self.uinput_failed_at = None
+        self.held = {}            # output code -> how many buttons hold it
+        self.pressed = {}         # (path, button) -> output codes, for release
+        self.move_rest = [0.0, 0.0]
+        self.wheel_rest = [0.0, 0.0]
+        self.notch_rest = [0, 0]
+        self.manual_off = os.path.exists(OFF_FLAG)
+        self.paused = None        # why it is stepping aside, or None
+        self.running = True
+
+    # -- virtual mouse and keyboard
+    def outputs_ready(self):
+        if self.mouse and self.keyboard:
+            return True
+        if self.uinput_failed_at and time.monotonic() - self.uinput_failed_at < 10:
+            return False
+        rel = [e.REL_X, e.REL_Y, e.REL_WHEEL, e.REL_HWHEEL]
+        rel += [c for c in (HI_RES_WHEEL, HI_RES_HWHEEL) if c is not None]
+        try:
+            self.mouse = evdev.UInput({e.EV_KEY: list(MOUSE_BUTTONS), e.EV_REL: rel},
+                                      name=OWN_PREFIX + " mouse")
+            self.keyboard = evdev.UInput({e.EV_KEY: KEYBOARD_KEYS},
+                                         name=OWN_PREFIX + " keyboard")
+        except Exception as exc:
+            self.close_outputs()
+            if self.uinput_failed_at is None:
+                log("cannot open /dev/uinput (%s) - retrying every 10s" % exc)
+            self.uinput_failed_at = time.monotonic()
+            return False
+        self.uinput_failed_at = None
+        return True
+
+    def close_outputs(self):
+        for dev in (self.mouse, self.keyboard):
+            if dev:
+                try:
+                    dev.close()
+                except Exception:
+                    pass
+        self.mouse = self.keyboard = None
+
+    def emit_key(self, code, down):
+        # Only the first press and the last release reach the desktop, so two
+        # controllers holding the same button don't confuse it.
+        before = self.held.get(code, 0)
+        after = before + 1 if down else max(0, before - 1)
+        self.held[code] = after
+        if (before == 0) == (after == 0) or not self.outputs_ready():
+            return
+        target = self.mouse if code in MOUSE_BUTTONS else self.keyboard
+        target.write(e.EV_KEY, code, 1 if down else 0)
+        target.syn()
+
+    def release_all(self):
+        for key in list(self.pressed):
+            self.press(key, False)
+        for code in [c for c, n in self.held.items() if n > 0]:
+            self.held[code] = 1
+            self.emit_key(code, False)
+        self.move_rest = [0.0, 0.0]
+        self.wheel_rest = [0.0, 0.0]
+        self.notch_rest = [0, 0]
+
+    def press(self, key, down):
+        if down:
+            codes = BUTTONS[key[1]][1]
+            if key in self.pressed:
+                return
+            self.pressed[key] = codes
+            for code in codes:
+                self.emit_key(code, True)
+        else:
+            codes = self.pressed.pop(key, None)
+            for code in reversed(codes or ()):
+                self.emit_key(code, False)
+
+    # -- controllers coming and going
+    def rescan(self):
+        try:
+            paths = set(evdev.list_devices())
+        except OSError:
+            paths = set()
+        for path in list(self.pads):
+            if path not in paths:
+                self.drop(path)
+        self.ignored &= paths
+        for path in sorted(paths - set(self.pads) - self.ignored):
+            try:
+                dev = evdev.InputDevice(path)
+            except OSError:
+                continue          # no permission (yet) or already gone
+            if not is_gamepad(dev):
+                dev.close()
+                self.ignored.add(path)
+                continue
+            self.pads[path] = Pad(path, dev)
+            self.selector.register(dev, selectors.EVENT_READ, path)
+            log("controller connected: " + dev.name)
+
+    def drop(self, path):
+        pad = self.pads.pop(path, None)
+        if not pad:
+            return
+        try:
+            self.selector.unregister(pad.dev)
+        except (KeyError, ValueError):
+            pass
+        try:
+            pad.dev.close()
+        except OSError:
+            pass
+        for key in [k for k in self.pressed if k[0] == path]:
+            self.press(key, False)
+        log("controller disconnected: " + path)
+
+    # -- stepping aside for games and Steam
+    def check_pause(self):
+        reason = None
+        if game_running():
+            reason = "a game is running"
+        elif steam_signed_in():
+            reason = "Steam is driving the controller"
+        if reason != self.paused:
+            self.paused = reason
+            if reason:
+                self.release_all()
+                log("paused: " + reason)
+            else:
+                log("active")
+
+    def set_manual_off(self, off):
+        self.manual_off = off
+        try:
+            os.makedirs(STATE_DIR, exist_ok=True)
+            if off:
+                open(OFF_FLAG, "w").close()
+            elif os.path.exists(OFF_FLAG):
+                os.remove(OFF_FLAG)
+        except OSError:
+            pass
+        if off:
+            self.release_all()
+            notify("Controller mouse off", "Press the Guide / PS / Home button to turn it back on.")
+        else:
+            notify("Controller mouse on", "Left stick moves the pointer, A clicks.")
+
+    # -- input
+    @staticmethod
+    def toggle_osk():
+        """Open or close the on-screen keyboard (through the niix-osk shell
+        extension). Without the extension, only GNOME's setting can be
+        switched - the keyboard then appears when a text field is selected."""
+        try:
+            done = subprocess.run(["gdbus", "call", "--session", "--dest", "org.gnome.Shell",
+                                   "--object-path", "/org/niixa/Osk", "--method", "org.niixa.Osk.Toggle"],
+                                  capture_output=True, timeout=5).returncode == 0
+        except (OSError, subprocess.SubprocessError):
+            done = False
+        if done:
+            return
+        key = ["org.gnome.desktop.a11y.applications", "screen-keyboard-enabled"]
+        try:
+            now = subprocess.run(["gsettings", "get"] + key, capture_output=True,
+                                 text=True, timeout=5).stdout.strip()
+            subprocess.run(["gsettings", "set"] + key + ["false" if now == "true" else "true"],
+                           timeout=5, check=False)
+            if now != "true":
+                notify("On-screen keyboard on", "It appears when a text field is selected.")
+        except (OSError, subprocess.SubprocessError):
+            pass
+
+    def on_button(self, path, button, down):
+        action = BUTTONS.get(button)
+        if action is None:
+            return
+        kind = action[0]
+        if kind == TOGGLE:
+            if down and not self.paused:
+                self.set_manual_off(not self.manual_off)
+            return
+        if down and (self.manual_off or self.paused):
+            return
+        if kind == OSK:
+            if down:
+                self.toggle_osk()
+            return
+        self.press((path, button), down)
+
+    def on_event(self, pad, ev):
+        if ev.type == e.EV_KEY:
+            if ev.value in (0, 1):
+                self.on_button(pad.path, ev.code, ev.value == 1)
+        elif ev.type == e.EV_ABS:
+            if ev.code in pad.hat:
+                old, new = pad.hat[ev.code], ev.value
+                if old != new:
+                    pad.hat[ev.code] = new
+                    if old:
+                        self.on_button(pad.path, HAT[(ev.code, old)], False)
+                    if new in (-1, 1):
+                        self.on_button(pad.path, HAT[(ev.code, new)], True)
+            elif ev.code in pad.axes:
+                role = pad.set_axis(ev.code, ev.value)
+                if role in (TRIGGER_L, TRIGGER_R):
+                    button = e.BTN_TL2 if role == TRIGGER_L else e.BTN_TR2
+                    value = pad.values[role]
+                    if not pad.trigger_down[role] and value > TRIGGER_PRESS:
+                        pad.trigger_down[role] = True
+                        self.on_button(pad.path, button, True)
+                    elif pad.trigger_down[role] and value < TRIGGER_RELEASE:
+                        pad.trigger_down[role] = False
+                        self.on_button(pad.path, button, False)
+
+    def motion(self, dt):
+        """Moves the pointer and scrolls; returns True while a stick is pushed."""
+        mx = my = sx = sy = 0.0
+        for pad in self.pads.values():
+            x, y = pad.stick(STICK_LX, STICK_LY)
+            mx += x
+            my += y
+            x, y = pad.stick(STICK_RX, STICK_RY)
+            sx += x
+            sy += y
+        if not (mx or my or sx or sy):
+            return False
+        if self.manual_off or self.paused or not self.outputs_ready():
+            return True
+
+        self.move_rest[0] += mx * POINTER_SPEED * dt
+        self.move_rest[1] += my * POINTER_SPEED * dt
+        dx, dy = int(self.move_rest[0]), int(self.move_rest[1])
+        self.move_rest[0] -= dx
+        self.move_rest[1] -= dy
+        if dx:
+            self.mouse.write(e.EV_REL, e.REL_X, dx)
+        if dy:
+            self.mouse.write(e.EV_REL, e.REL_Y, dy)
+
+        # Stick up scrolls up; the wheel counts "up" as positive.
+        self.wheel_rest[0] += -sy * SCROLL_SPEED * dt
+        self.wheel_rest[1] += sx * SCROLL_SPEED * dt
+        for i, (hires, notch) in enumerate(((HI_RES_WHEEL, e.REL_WHEEL),
+                                            (HI_RES_HWHEEL, e.REL_HWHEEL))):
+            step = int(self.wheel_rest[i])
+            if not step:
+                continue
+            self.wheel_rest[i] -= step
+            if hires is not None:
+                self.mouse.write(e.EV_REL, hires, step)
+            self.notch_rest[i] += step
+            notches = int(self.notch_rest[i] / 120)
+            if notches:
+                self.notch_rest[i] -= notches * 120
+                self.mouse.write(e.EV_REL, notch, notches)
+        self.mouse.syn()
+        return True
+
+    # -- main loop
+    def run(self):
+        log("started" + (" (switched off - Guide button turns it on)" if self.manual_off else ""))
+        next_scan = next_check = 0.0
+        last = time.monotonic()
+        moving = False
+        while self.running:
+            now = time.monotonic()
+            if now >= next_scan:
+                self.rescan()
+                next_scan = now + RESCAN_EVERY
+            if now >= next_check:
+                if self.pads:
+                    self.check_pause()
+                next_check = now + CHECK_EVERY
+
+            timeout = TICK if moving else 0.5
+            for key, _ in self.selector.select(timeout):
+                pad = self.pads.get(key.data)
+                if not pad:
+                    continue
+                try:
+                    for ev in pad.dev.read():
+                        self.on_event(pad, ev)
+                except BlockingIOError:
+                    pass
+                except OSError:
+                    self.drop(pad.path)
+
+            now = time.monotonic()
+            moving = self.motion(min(now - last, 0.05))
+            last = now
+
+        self.release_all()
+        self.close_outputs()
+        for path in list(self.pads):
+            self.drop(path)
+
+
+def main():
+    nav = Navigator()
+
+    def stop(_signum, _frame):
+        nav.running = False
+
+    signal.signal(signal.SIGTERM, stop)
+    signal.signal(signal.SIGINT, stop)
+    nav.run()
+
+
+if __name__ == "__main__":
+    main()

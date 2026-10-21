@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=Install NiiX
+Comment=Install NiiX Arch on this computer
+Icon=/usr/share/pixmaps/niixarch-logo.png
+Exec=/usr/local/bin/niix-installer
+Terminal=false
+StartupNotify=true
+Categories=System;

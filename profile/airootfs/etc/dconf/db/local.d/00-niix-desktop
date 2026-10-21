@@ -1,0 +1,132 @@
+[org/gnome/desktop/interface]
+color-scheme='prefer-dark'
+gtk-theme='Adwaita-dark'
+icon-theme='NiiX'
+accent-color='pink'
+enable-animations=true
+enable-hot-corners=false
+show-battery-percentage=true
+clock-show-weekday=true
+
+[org/gnome/desktop/background]
+picture-uri='file:///usr/share/backgrounds/niix/niix-background.png'
+picture-uri-dark='file:///usr/share/backgrounds/niix/niix-background.png'
+picture-options='zoom'
+
+[org/gnome/desktop/wm/preferences]
+button-layout='appmenu:minimize,maximize,close'
+num-workspaces=1
+
+[org/gnome/mutter]
+dynamic-workspaces=false
+edge-tiling=true
+
+[org/gnome/desktop/session]
+idle-delay=uint32 0
+
+[org/gnome/settings-daemon/plugins/power]
+power-button-action='interactive'
+sleep-inactive-ac-type='nothing'
+
+[org/gnome/desktop/sound]
+event-sounds=false
+
+[org/gnome/desktop/notifications]
+show-in-lock-screen=false
+
+[org/gnome/desktop/media-handling]
+automount=true
+automount-open=false
+autorun-never=false
+
+[org/gnome/shell]
+disable-user-extensions=false
+
+[org/gnome/settings-daemon/plugins/media-keys]
+terminal=@as []
+
+[com/github/amezin/ddterm]
+ddterm-toggle-hotkey=['F12', '<Control><Alt>t']
+window-above=true
+hide-when-focus-lost=false
+use-system-font=false
+custom-font='Hack Nerd Font Bold 12'
+
+[org/gnome/terminal/legacy/profiles:]
+default='b1dcc9dd-5262-4d8d-a863-c897e6d979b9'
+list=['b1dcc9dd-5262-4d8d-a863-c897e6d979b9']
+
+[org/gnome/terminal/legacy/profiles:/:b1dcc9dd-5262-4d8d-a863-c897e6d979b9]
+visible-name='NiiX'
+use-system-font=false
+font='Hack Nerd Font Bold 12'
+audible-bell=false
+scrollback-unlimited=true
+
+[org/gnome/shell/extensions/dash-to-panel]
+panel-positions='{"0":"BOTTOM"}'
+panel-sizes='{"0":44}'
+panel-lengths='{"0":100}'
+panel-anchors='{"0":"LEFT"}'
+multi-monitors=false
+show-apps-button=false
+panel-element-positions='{"0":[{"element":"showAppsButton","visible":false,"position":"stackedTL"},{"element":"activitiesButton","visible":false,"position":"stackedTL"},{"element":"leftBox","visible":true,"position":"stackedTL"},{"element":"taskbar","visible":true,"position":"stackedTL"},{"element":"centerBox","visible":true,"position":"stackedBR"},{"element":"rightBox","visible":true,"position":"stackedBR"},{"element":"dateMenu","visible":true,"position":"stackedBR"},{"element":"systemMenu","visible":true,"position":"stackedBR"},{"element":"desktopButton","visible":true,"position":"stackedBR"}]}'
+dot-position='BOTTOM'
+show-appmenu=false
+group-apps=true
+isolate-workspaces=false
+appicon-margin=4
+appicon-padding=4
+animate-appicon-hover=false
+show-showdesktop-button=true
+trans-use-custom-opacity=true
+trans-panel-opacity=0.9
+# Pink accent matching GNOME's 'pink' accent-color
+focus-highlight=true
+focus-highlight-color='rgba(255, 107, 129, 0.35)'
+focus-highlight-opacity=35
+dot-color-override=true
+dot-color-1='#ff6b81'
+dot-color-2='#ff6b81'
+dot-color-3='#ff6b81'
+dot-color-4='#ff6b81'
+highlight-appicon-hover=true
+highlight-appicon-hover-background-color='rgba(255, 107, 129, 0.15)'
+highlight-appicon-pressed-background-color='rgba(255, 107, 129, 0.25)'
+
+[org/gnome/shell/extensions/arcmenu]
+pinned-apps=[{'id': 'org.gnome.Nautilus.desktop'}, {'id': 'org.gnome.Terminal.desktop'}]
+menu-layout='Default'
+position-in-panel='Left'
+menu-button-appearance='Icon_Text'
+menu-button-text='NiiX'
+menu-button-icon='/usr/share/pixmaps/niixarch-logo.png'
+menu-button-icon-size=28
+menu-button-position-offset=0
+multi-monitor=false
+arcmenu-hotkey=['Super_L']
+override-menu-theme=true
+menu-background-color='rgba(40, 24, 32, 0.98)'
+menu-foreground-color='rgba(255, 255, 255, 1)'
+menu-border-color='rgba(255, 107, 129, 0.40)'
+menu-border-width=1
+menu-border-radius=8
+menu-separator-color='rgba(255, 107, 129, 0.25)'
+menu-item-hover-bg-color='rgba(255, 107, 129, 0.30)'
+menu-item-hover-fg-color='rgba(255, 255, 255, 1)'
+menu-item-active-bg-color='rgba(255, 107, 129, 0.45)'
+menu-item-active-fg-color='rgba(255, 255, 255, 1)'
+
+[org/gnome/shell/extensions/system-monitor]
+show-swap=false
+
+[org/gnome/shell/extensions/screen-rotate]
+flip-orientation=false
+hide-lock-rotate=false
+debug-logging=false
+
+[org/gnome/shell/extensions/tiling-assistant]
+enable-layout-picker=false
+enable-tiling-popup=false
+enable-raise-tile-group=false
+toggle-maximize-tophalf-timer=2147483647

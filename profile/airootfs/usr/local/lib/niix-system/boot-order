@@ -1,0 +1,33 @@
+#!/bin/bash
+# boot-order - puts the NiiX boot menu back first in the firmware's boot order.
+#
+# Windows updates often move Windows Boot Manager to the front, and the PC
+# then starts Windows directly as if NiiX were gone. The NiiX menu lists
+# Windows too, so it belongs first. This runs at every NiiX start (reach NiiX
+# once through the firmware's boot menu, F12/F11/Esc, after such an update)
+# and changes nothing when the order is already right.
+# Off: sudo systemctl disable niix-boot-order.service
+set -uo pipefail
+
+LABEL="NiiX Arch (Limine)"
+
+out=$(efibootmgr 2>/dev/null) || exit 0
+niix=$(awk -v label="$LABEL" '
+    /^Boot[0-9A-Fa-f]{4}/ {
+        name = $0; sub(/^Boot[0-9A-Fa-f]{4}\*? /, "", name); sub(/\t.*/, "", name)
+        if (name == label) { print substr($1, 5, 4); exit } }' <<< "$out")
+[ -n "$niix" ] || exit 0
+order=$(sed -n 's/^BootOrder: //p' <<< "$out")
+[ "${order%%,*}" = "$niix" ] && exit 0
+
+new=$niix
+IFS=, read -ra entries <<< "$order"
+for entry in "${entries[@]}"; do
+    [ -n "$entry" ] && [ "$entry" != "$niix" ] && new+=",$entry"
+done
+if efibootmgr -o "$new" >/dev/null 2>&1; then
+    echo "NiiX boot menu is first in the boot order again (was: ${order:-empty})"
+else
+    echo "Could not change the boot order - the firmware refused it" >&2
+fi
+exit 0

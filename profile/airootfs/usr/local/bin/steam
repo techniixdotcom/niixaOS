@@ -1,0 +1,80 @@
+#!/bin/bash
+# NiiX's Steam: the real Steam with niix-gpu's settings (the session has them
+# already, but not a TTY or a login from before niix-gpu changed its choice).
+#
+# The very first start downloads Steam's client, and Steam's own progress
+# window often never shows up, so it looks like nothing happens. Until that
+# first start is through, this reads Steam's output and shows the progress
+# itself, then a one-time setup tip.
+#
+# Remove with: sudo rm /usr/local/bin/steam /usr/local/share/applications/steam.desktop
+STEAM=(/usr/local/bin/niix-gpu run /usr/bin/steam)
+STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/niix"
+READY="$STATE_DIR/steam-ready"
+
+TIP="One-time setup for the best experience: in Steam go to Settings -> Compatibility, turn on \"Enable Steam Play for all other titles\", and pick Proton-CachyOS (already installed; GE-Proton is there too) as the default tool. Steam restarts once.
+
+NiiX pre-loads Steam in the background shortly after each login, so later starts are much faster."
+
+for arg in "$@"; do
+    [ "$arg" = -silent ] && exec "${STEAM[@]}" "$@"
+done
+if [ -e "$READY" ] || ! command -v zenity >/dev/null 2>&1; then
+    exec "${STEAM[@]}" "$@"
+fi
+
+# Steam prints "Downloading update (1,234 of 386,355 KB)..." and later
+# "Update complete, launching..."; its web UI process starting means it is
+# up even when there was nothing to download.
+follow_first_start() {
+    local line done_kb total_kb progress done=false
+    trap '' PIPE
+    exec {progress}> >(zenity --progress --title="Steam" --width=460 --percentage=0 \
+        --text="Starting Steam for the first time..." --auto-close --no-cancel 2>/dev/null)
+
+    # printf to the window, which may already be gone.
+    # shellcheck disable=SC2059  # the callers pass the format
+    show() { printf "$@" 1>&"$progress"; } 2>/dev/null
+
+    finish() {
+        $done && return
+        done=true
+        show '100\n'
+        exec {progress}>&-
+        mkdir -p "$STATE_DIR" && touch "$READY"
+        zenity --info --title="Steam is ready" --width=460 --text="$TIP" >/dev/null 2>&1 &
+    }
+
+    while :; do
+        if IFS= read -r -t 2 line; then
+            printf '%s\n' "$line"
+            $done && continue
+            case "$line" in
+                *"Downloading update ("*" of "*" KB)"*)
+                    done_kb=${line#*Downloading update (}
+                    total_kb=${done_kb#* of }
+                    done_kb=${done_kb%% of *}; done_kb=${done_kb//,/}
+                    total_kb=${total_kb%% KB*}; total_kb=${total_kb//,/}
+                    if [[ "$done_kb" =~ ^[0-9]+$ && "$total_kb" =~ ^[1-9][0-9]*$ ]]; then
+                        show '%d\n# Downloading Steam: %d of %d MB\n' \
+                            $(( done_kb * 90 / total_kb )) $(( done_kb / 1024 )) $(( total_kb / 1024 ))
+                    fi ;;
+                *"Extracting package"*|*"Installing update"*)
+                    show '95\n# Installing Steam...\n' ;;
+                *"Verifying installation"*)
+                    show '# Checking the Steam files...\n' ;;
+                *"Update complete"*)
+                    finish ;;
+            esac
+        elif (( $? > 128 )); then      # quiet for 2 s
+            $done || ! pgrep -u "$(id -u)" -x steamwebhelper >/dev/null || finish
+        else
+            break                      # Steam exited
+        fi
+    done
+    # Steam quit before it was up: close the window, show it again next time.
+    $done || show '100\n'
+}
+
+"${STEAM[@]}" "$@" 2>&1 | follow_first_start
+exit "${PIPESTATUS[0]}"

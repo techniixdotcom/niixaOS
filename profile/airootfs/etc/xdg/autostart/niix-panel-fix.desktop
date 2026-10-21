@@ -1,0 +1,6 @@
+[Desktop Entry]
+Type=Application
+Name=NiiX panel layout
+Exec=/usr/local/bin/niix-panel-fix --watch
+X-GNOME-Autostart-enabled=true
+NoDisplay=true

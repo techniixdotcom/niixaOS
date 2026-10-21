@@ -1,0 +1,6 @@
+[Unit]
+Description=Give SteamVR's compositor the priority it needs for %i (NiiX)
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/niix-steamvr-caps %i
